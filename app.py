@@ -11,6 +11,7 @@ import io
 import itertools
 import json
 import random
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -147,6 +148,7 @@ class LoadReport:
     source_kind: str = "arquivo"
     loaded_at: datetime = field(default_factory=datetime.now)
     warnings: list[str] = field(default_factory=list)
+    metadata: dict[str, object] = field(default_factory=dict)
 
     @property
     def success_rate(self) -> float:
@@ -194,6 +196,42 @@ class BacktestResult:
     @property
     def difference(self) -> float:
         return self.strategy_average - self.random_average
+
+
+@dataclass(frozen=True, slots=True)
+class PrizeTier:
+    description: str
+    winners: int
+    prize_value: float
+    tier: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialContest:
+    lottery_name: str
+    contest: int
+    draw: Draw
+    draw_order: Draw
+    draw_date: str
+    next_draw_date: str
+    accumulated: bool
+    estimated_next_prize: float
+    accumulated_next_prize: float
+    revenue: float
+    venue: str
+    city_uf: str
+    previous_contest: int | None
+    next_contest: int | None
+    prize_tiers: tuple[PrizeTier, ...]
+    source_url: str
+
+    @property
+    def main_tier_winners(self) -> int:
+        return self.prize_tiers[0].winners if self.prize_tiers else 0
+
+    @property
+    def main_tier_prize(self) -> float:
+        return self.prize_tiers[0].prize_value if self.prize_tiers else 0.0
 
 
 # ===== validators.py =====
@@ -627,56 +665,147 @@ def load_tabular_bytes(
     raise ValueError(f"Não foi possível interpretar o arquivo: {last_error}")
 
 
-def _fetch_json(url: str, timeout: int = 12) -> dict:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 LotteryStatisticsDashboard/2.0",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise ConnectionError(f"Falha ao consultar a CAIXA: {exc}") from exc
+def _caixa_api_url(config: LotteryConfig, contest: int | None = None) -> str:
+    base = f"{CAIXA_API_BASE}/{config.slug}"
+    return f"{base}/{int(contest)}" if contest is not None else base
 
 
-def fetch_latest_contest_number(config: LotteryConfig) -> int:
-    payload = _fetch_json(f"{CAIXA_API_BASE}/{config.slug}")
+def _fetch_json(url: str, timeout: int = 12, attempts: int = 3) -> dict:
+    """Consulta JSON da CAIXA com retries curtos e mensagens de erro legíveis."""
+    last_error: Exception | None = None
+    attempts = max(1, int(attempts))
+
+    for attempt in range(attempts):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": "Mozilla/5.0 (compatible; LoteriasLab/3.1; +https://caixa.gov.br)",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+                payload = json.loads(raw.decode("utf-8-sig"))
+                if not isinstance(payload, dict):
+                    raise ValueError("A CAIXA retornou um JSON em formato inesperado.")
+                return payload
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            # 4xx (exceto rate limit) tende a ser erro definitivo de concurso/URL.
+            if 400 <= exc.code < 500 and exc.code != 429:
+                break
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            last_error = exc
+
+        if attempt < attempts - 1:
+            time.sleep(0.6 * (2 ** attempt))
+
+    raise ConnectionError(f"Falha ao consultar a API da CAIXA em {url}: {last_error}") from last_error
+
+
+def parse_official_contest(payload: dict, config: LotteryConfig, source_url: str = "") -> OfficialContest:
     number = payload.get("numero")
     if number is None:
         raise ValueError("A resposta da CAIXA não informou o número do concurso.")
-    return int(number)
+
+    raw_sorted = payload.get("listaDezenas") or payload.get("dezenasSorteadasOrdemSorteio")
+    if not raw_sorted:
+        raise ValueError(f"Concurso {number} sem dezenas na resposta da CAIXA.")
+
+    raw_order = payload.get("dezenasSorteadasOrdemSorteio") or raw_sorted
+    draw = validate_draw([int(str(value)) for value in raw_sorted], config)
+    order_values = tuple(int(str(value)) for value in raw_order)
+    # A ordem do sorteio não deve ser ordenada; apenas validamos conjunto/quantidade.
+    validate_draw(order_values, config)
+
+    tiers: list[PrizeTier] = []
+    for item in payload.get("listaRateioPremio") or []:
+        tiers.append(
+            PrizeTier(
+                description=str(item.get("descricaoFaixa") or f"Faixa {item.get('faixa', '')}").strip(),
+                winners=int(item.get("numeroDeGanhadores") or 0),
+                prize_value=float(item.get("valorPremio") or 0.0),
+                tier=int(item["faixa"]) if item.get("faixa") is not None else None,
+            )
+        )
+
+    def optional_int(value: object) -> int | None:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return OfficialContest(
+        lottery_name=config.name,
+        contest=int(number),
+        draw=draw,
+        draw_order=order_values,
+        draw_date=str(payload.get("dataApuracao") or ""),
+        next_draw_date=str(payload.get("dataProximoConcurso") or ""),
+        accumulated=bool(payload.get("acumulado", False)),
+        estimated_next_prize=float(payload.get("valorEstimadoProximoConcurso") or 0.0),
+        accumulated_next_prize=float(payload.get("valorAcumuladoProximoConcurso") or 0.0),
+        revenue=float(payload.get("valorArrecadado") or 0.0),
+        venue=str(payload.get("localSorteio") or ""),
+        city_uf=str(payload.get("nomeMunicipioUFSorteio") or ""),
+        previous_contest=optional_int(payload.get("numeroConcursoAnterior")),
+        next_contest=optional_int(payload.get("numeroConcursoProximo")),
+        prize_tiers=tuple(tiers),
+        source_url=source_url or _caixa_api_url(config, int(number)),
+    )
+
+
+def fetch_official_contest(
+    config: LotteryConfig, contest: int | None = None, timeout: int = 8, attempts: int = 2
+) -> OfficialContest:
+    """Busca o concurso mais recente ou um concurso específico no endpoint do Portal Loterias."""
+    url = _caixa_api_url(config, contest)
+    return parse_official_contest(_fetch_json(url, timeout=timeout, attempts=attempts), config, url)
+
+
+def fetch_latest_contest_number(config: LotteryConfig) -> int:
+    return fetch_official_contest(config).contest
 
 
 def _fetch_contest(config: LotteryConfig, contest: int) -> tuple[int, tuple[int, ...]]:
-    payload = _fetch_json(f"{CAIXA_API_BASE}/{config.slug}/{contest}")
-    raw = payload.get("listaDezenas") or payload.get("dezenasSorteadasOrdemSorteio")
-    if not raw:
-        raise ValueError(f"Concurso {contest} sem dezenas na resposta.")
-    numbers = [int(str(value)) for value in raw]
-    return contest, validate_draw(numbers, config)
+    official = fetch_official_contest(config, contest)
+    return official.contest, official.draw
 
 
 def fetch_recent_official_draws(
     config: LotteryConfig,
     quantity: int,
-    max_workers: int = 10,
+    max_workers: int = 6,
 ) -> LoadReport:
+    """Carrega concursos recentes da CAIXA preservando a ordem cronológica."""
     quantity = max(1, int(quantity))
-    latest = fetch_latest_contest_number(config)
+    latest_data = fetch_official_contest(config)
+    latest = latest_data.contest
     start = max(1, latest - quantity + 1)
     contests = list(range(start, latest + 1))
     report = LoadReport(
         total_rows=len(contests),
-        source_name="CAIXA — endpoint público do Portal Loterias",
+        source_name="CAIXA — API do Portal Loterias",
         source_kind="oficial",
+        metadata={
+            "latest_contest": latest_data.contest,
+            "latest_date": latest_data.draw_date,
+            "next_date": latest_data.next_draw_date,
+            "estimated_next_prize": latest_data.estimated_next_prize,
+            "accumulated": latest_data.accumulated,
+            "source_url": latest_data.source_url,
+        },
     )
 
-    found: dict[int, tuple[int, ...]] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch_contest, config, n): n for n in contests}
+    # Já temos o concurso mais recente; evita uma chamada duplicada.
+    found: dict[int, tuple[int, ...]] = {latest_data.contest: latest_data.draw}
+    pending = [n for n in contests if n != latest_data.contest]
+
+    with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), 8))) as executor:
+        futures = {executor.submit(_fetch_contest, config, n): n for n in pending}
         for future in as_completed(futures):
             contest = futures[future]
             try:
@@ -694,13 +823,13 @@ def fetch_recent_official_draws(
 
     if report.rejected_rows:
         report.warnings.append(
-            "Alguns concursos não puderam ser carregados. O endpoint do Portal Loterias pode oscilar ou mudar sem aviso."
+            "Alguns concursos não puderam ser carregados. A API do Portal Loterias pode oscilar ou limitar requisições temporariamente."
         )
     return report
 
 
 # ===== V3 advanced services =====
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 DB_PATH = Path(os.getenv("LOTTERY_LAB_DB", ".lottery_lab.db"))
 LOG_PATH = Path(os.getenv("LOTTERY_LAB_LOG", "lottery_lab.log"))
 
@@ -1393,20 +1522,22 @@ def data_source_controls(lottery_name: str, config: LotteryConfig) -> LoadReport
     source = st.sidebar.radio("Fonte", ["Dados oficiais CAIXA", "Arquivo CSV/Excel", "Simulação"], key="source_mode")
 
     if source == "Dados oficiais CAIXA":
-        official_qty = st.sidebar.slider("Concursos recentes", 20, 1000, 200, step=20)
-        auto = st.sidebar.checkbox("Atualizar automaticamente ao abrir", value=False)
-        should_load = st.sidebar.button("Atualizar agora", use_container_width=True, type="primary")
+        st.sidebar.caption("O último resultado é consultado automaticamente com 1 chamada. O controle abaixo sincroniza o histórico usado nas análises.")
+        official_qty = st.sidebar.slider("Concursos para sincronizar", 20, 1000, 200, step=20)
+        auto = st.sidebar.checkbox("Sincronizar histórico ao abrir", value=False, help="Pode fazer várias chamadas à API. Para apenas ver o último resultado, não é necessário ativar.")
+        should_load = st.sidebar.button("Sincronizar histórico CAIXA", use_container_width=True, type="primary")
         if auto and "load_report" not in st.session_state:
             should_load = True
         if should_load:
             try:
-                with st.spinner("Consultando resultados da CAIXA..."):
+                with st.spinner("Sincronizando concursos com a API da CAIXA..."):
                     st.session_state.load_report = cached_official(lottery_name, official_qty)
                     st.session_state.bet_history = []
                 logger.info("Official data loaded: %s %s", lottery_name, official_qty)
+                st.sidebar.success(f"{st.session_state.load_report.valid_rows} concursos sincronizados.")
             except Exception as exc:
                 logger.exception("Official load failed")
-                st.sidebar.error("Não foi possível consultar a CAIXA agora. Use arquivo ou simulação como alternativa.")
+                st.sidebar.error("Não foi possível sincronizar o histórico da CAIXA agora. O resultado mais recente pode continuar disponível acima; use arquivo ou simulação como alternativa.")
 
     elif source == "Arquivo CSV/Excel":
         uploaded = st.sidebar.file_uploader("CSV, TXT, XLSX ou XLS", type=["csv", "txt", "xlsx", "xls"])
@@ -1478,6 +1609,57 @@ def cached_load_file(data: bytes, filename: str, lottery_name: str) -> LoadRepor
     return load_tabular_bytes(data, filename, LOTTERIES[lottery_name])
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_latest_official(lottery_name: str) -> OfficialContest:
+    return fetch_official_contest(LOTTERIES[lottery_name])
+
+
+def render_latest_official_card(lottery_name: str, config: LotteryConfig) -> None:
+    """Exibe automaticamente o resultado atual da CAIXA sem exigir histórico carregado."""
+    st.markdown("### 🔴 Resultado oficial CAIXA — atualização automática")
+    try:
+        latest = cached_latest_official(lottery_name)
+    except Exception as exc:
+        st.warning("Não foi possível consultar o resultado oficial da CAIXA neste momento. As demais fontes do app continuam disponíveis.")
+        logger.warning("Latest CAIXA result unavailable for %s: %s", lottery_name, exc)
+        return
+
+    top_left, top_mid, top_right, refresh_col = st.columns([1.1, 1, 1.15, .7])
+    top_left.metric("Concurso", latest.contest)
+    top_mid.metric("Data", latest.draw_date or "—")
+    top_right.metric("Próximo prêmio estimado", currency_br(latest.estimated_next_prize) if latest.estimated_next_prize else "—")
+    if refresh_col.button("↻ Atualizar", key=f"refresh_caixa_{lottery_name}", use_container_width=True):
+        cached_latest_official.clear()
+        st.rerun()
+
+    st.markdown(balls_html(latest.draw, config), unsafe_allow_html=True)
+    status = "ACUMULOU" if latest.accumulated else f"{latest.main_tier_winners} ganhador(es) na faixa principal"
+    details = []
+    if latest.next_draw_date:
+        details.append(f"próximo sorteio: **{latest.next_draw_date}**")
+    if latest.venue or latest.city_uf:
+        place = " · ".join(x for x in (latest.venue, latest.city_uf) if x)
+        details.append(f"local: **{place}**")
+    st.caption(f"{status}" + (" · " + " · ".join(details) if details else ""))
+
+    with st.expander("Premiação e detalhes do concurso"):
+        if latest.prize_tiers:
+            prize_df = pd.DataFrame([
+                {
+                    "Faixa": tier.description,
+                    "Ganhadores": tier.winners,
+                    "Prêmio por aposta": currency_br(tier.prize_value),
+                }
+                for tier in latest.prize_tiers
+            ])
+            st.dataframe(prize_df, hide_index=True, use_container_width=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Acumulado próximo", currency_br(latest.accumulated_next_prize) if latest.accumulated_next_prize else "—")
+        c2.metric("Arrecadação", currency_br(latest.revenue) if latest.revenue else "—")
+        c3.metric("Próximo concurso", latest.next_contest or "—")
+        st.caption("Fonte: endpoint JSON do Portal Loterias/CAIXA. A resposta é armazenada em cache por 5 minutos para reduzir chamadas.")
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_official(lottery_name: str, quantity: int) -> LoadReport:
     return fetch_recent_official_draws(LOTTERIES[lottery_name], quantity)
@@ -1498,7 +1680,7 @@ def reset_lottery_state(lottery_name: str) -> None:
     st.session_state.current_lottery = lottery_name
     for key in [
         "load_report", "file_fingerprint", "bet_history", "backtest_result", "generated_games",
-        "closure_games", "checker_result", "ocr_text", "latest_official_result", "strategy_comparison", "mc_result"
+        "closure_games", "checker_result", "ocr_text", "latest_official_result", "strategy_comparison", "mc_result", "api_health"
     ]:
         st.session_state.pop(key, None)
 
@@ -1585,6 +1767,9 @@ st.markdown(
     <div style="opacity:.76">Análise histórica, geração por restrições, backtests, Monte Carlo, fechamentos, conferência e gestão de jogos.</div></div>""",
     unsafe_allow_html=True,
 )
+
+# Uma única chamada cacheada mantém o resultado mais recente visível mesmo sem histórico carregado.
+render_latest_official_card(lottery_name, config)
 
 # FAQ can render without a loaded dataset.
 if page != "❓ FAQ" and (report is None or not report.draws):
@@ -2078,9 +2263,8 @@ elif page == "✅ Conferidor & OCR":
     else:
         if st.button("Buscar último resultado da CAIXA",type="primary"):
             try:
-                latest=fetch_latest_contest_number(config)
-                _,draw=_fetch_contest(config,latest)
-                st.session_state.latest_official_result=(latest,draw)
+                official = fetch_official_contest(config)
+                st.session_state.latest_official_result=(official.contest,official.draw)
             except Exception as exc:
                 st.error(f"Falha ao consultar: {exc}")
         latest_data=st.session_state.get("latest_official_result")
@@ -2225,6 +2409,33 @@ elif page == "🗂️ Dados":
     st.dataframe(preview.tail(300),hide_index=True,use_container_width=True,height=500)
     st.download_button("Baixar amostra validada (CSV)",preview.to_csv(index=False).encode("utf-8-sig"),f"base_validada_{config.slug}.csv","text/csv",use_container_width=True)
 
+    st.markdown("### Diagnóstico da API CAIXA")
+    api_col1, api_col2 = st.columns([1, 2])
+    with api_col1:
+        if st.button("Testar API agora", use_container_width=True, key="api_health_test"):
+            started = time.perf_counter()
+            try:
+                test_result = fetch_official_contest(config, timeout=8, attempts=2)
+                elapsed = (time.perf_counter() - started) * 1000
+                st.session_state.api_health = {
+                    "ok": True,
+                    "contest": test_result.contest,
+                    "date": test_result.draw_date,
+                    "elapsed_ms": elapsed,
+                    "url": _caixa_api_url(config),
+                }
+            except Exception as exc:
+                elapsed = (time.perf_counter() - started) * 1000
+                st.session_state.api_health = {"ok": False, "error": str(exc), "elapsed_ms": elapsed, "url": _caixa_api_url(config)}
+    with api_col2:
+        st.code(_caixa_api_url(config), language=None)
+    health = st.session_state.get("api_health")
+    if health:
+        if health.get("ok"):
+            st.success(f"API respondendo · concurso {health['contest']} · {health['date']} · {health['elapsed_ms']:.0f} ms")
+        else:
+            st.error(f"API indisponível no teste ({health['elapsed_ms']:.0f} ms): {health.get('error','erro desconhecido')}")
+
     st.markdown("### Metadados e preços de referência")
     meta=[]
     for name,cfg in LOTTERIES.items():
@@ -2269,7 +2480,8 @@ elif page == "❓ FAQ":
         ("⭐ Estratégias favoritas", "Salva os parâmetros de uma configuração de gerador para referência futura. Nesta versão o favorito é armazenado e listado; ele não altera a probabilidade matemática do sorteio."),
         ("🔐 Perfil e senha opcional", "O perfil local separa dados no SQLite. Se você definir APP_PASSWORD nos Secrets do Streamlit, o app também exige uma senha global antes de abrir. Isso não substitui autenticação corporativa multiusuário."),
         ("💾 Persistência", "O app usa SQLite local. Em computador próprio ele persiste normalmente; no Streamlit Cloud o disco pode ser efêmero em reinicializações/deploys. Por isso existe exportação de backup."),
-        ("🔄 Atualização automática", "Na fonte CAIXA você pode habilitar carregamento automático ao abrir. A consulta é cacheada para reduzir chamadas. O endpoint usado pelo Portal Loterias pode mudar ou oscilar, por isso arquivo/simulação continuam disponíveis."),
+        ("🔴 Resultado oficial automático", "Ao abrir o app, uma única chamada cacheada consulta o último concurso da modalidade diretamente no endpoint JSON do Portal Loterias/CAIXA. O card mostra concurso, data, dezenas, situação de acumulação, estimativa do próximo prêmio e premiação por faixa. O cache dura 5 minutos e há um botão para forçar atualização."),
+        ("🔄 Sincronização do histórico CAIXA", "A sincronização do histórico é separada do resultado ao vivo: você escolhe quantos concursos deseja carregar para as análises. Cada concurso histórico exige consulta própria ao endpoint, então a opção automática vem desligada para evitar centenas de chamadas desnecessárias."),
         ("🧾 Versionamento da base", "A página Dados mostra um hash SHA-256 reduzido da sequência de concursos carregada, horário, origem e versão do app. Isso ajuda a identificar qual base estava ativa numa análise."),
         ("🛠️ Logs e observabilidade", "Erros e eventos relevantes são gravados em log local quando o ambiente permite. A página Dados mostra as últimas linhas para facilitar diagnóstico de deploy."),
         ("📱 Uso no celular", "A interface possui CSS responsivo, bolas e grades adaptáveis. O Streamlit Cloud não oferece, por si só, um modo PWA offline completo com service worker confiável; por isso a V3 prioriza uma experiência web responsiva em vez de prometer offline que pode não funcionar."),
@@ -2289,5 +2501,5 @@ elif page == "❓ FAQ":
         "**Persistência em nuvem:** o SQLite local pode ser apagado pelo ciclo de vida do Streamlit Cloud; use backups.  "
         "\n**PWA/offline real:** não é habilitado nesta versão porque o Streamlit Cloud não garante o escopo de service worker necessário.  "
         "\n**OCR:** depende de Tesseract e da qualidade da foto; revise o texto.  "
-        "\n**Endpoint CAIXA:** a integração usa o endpoint consumido pelo Portal Loterias e pode exigir manutenção se a CAIXA o alterar."
+        "\n**API CAIXA:** a integração usa o endpoint JSON público consumido pelo Portal Loterias (`servicebus2.caixa.gov.br/portaldeloterias/api`). Ele não é uma API contratualmente versionada para terceiros, portanto pode mudar ou oscilar; por isso arquivo e simulação permanecem como fallback."
     )
