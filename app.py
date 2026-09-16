@@ -11,6 +11,7 @@ import io
 import itertools
 import json
 import random
+import secrets
 import time
 import urllib.error
 import urllib.request
@@ -694,7 +695,7 @@ def _fetch_json(url: str, timeout: int = 12, attempts: int = 3) -> dict:
             url,
             headers={
                 "Accept": "application/json, text/plain, */*",
-                "User-Agent": "Mozilla/5.0 (compatible; LoteriasLab/3.3; +https://caixa.gov.br)",
+                "User-Agent": "Mozilla/5.0 (compatible; LoteriasLab/3.4; +https://caixa.gov.br)",
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
             },
@@ -863,7 +864,7 @@ def fetch_recent_official_draws(
 
 
 # ===== V3 advanced services =====
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.0"
 DB_PATH = Path(os.getenv("LOTTERY_LAB_DB", ".lottery_lab.db"))
 LOG_PATH = Path(os.getenv("LOTTERY_LAB_LOG", "lottery_lab.log"))
 
@@ -1337,21 +1338,45 @@ class LocalRepository:
             );
             """
         )
+        # Migração idempotente da carteira para V3.4. Bancos antigos continuam válidos.
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(bets)").fetchall()}
+        additions = {
+            "batch_id": "TEXT DEFAULT ''",
+            "batch_label": "TEXT DEFAULT ''",
+            "game_kind": "TEXT DEFAULT 'Jogo único'",
+            "creation_mode": "TEXT DEFAULT 'Manual'",
+            "blind_token": "TEXT DEFAULT ''",
+            "shares": "INTEGER DEFAULT 0",
+        }
+        for column, definition in additions.items():
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE bets ADD COLUMN {column} {definition}")
         self.conn.commit()
 
-    def add_bet(self, profile: str, lottery: str, numbers: Draw, contest: str = "", amount: float = 0.0, source: str = "manual", notes: str = "") -> None:
+    def add_bet(
+        self, profile: str, lottery: str, numbers: Draw, contest: str = "", amount: float = 0.0,
+        source: str = "manual", notes: str = "", *, batch_id: str = "", batch_label: str = "",
+        game_kind: str = "Jogo único", creation_mode: str = "Manual", blind_token: str = "", shares: int = 0,
+    ) -> None:
         if not self.enabled:
             return
         self.conn.execute(
-            "INSERT INTO bets(profile,created_at,lottery,numbers,contest,amount,source,notes) VALUES(?,?,?,?,?,?,?,?)",
-            (profile, datetime.now().isoformat(timespec="seconds"), lottery, ",".join(map(str, numbers)), contest, float(amount), source, notes),
+            """INSERT INTO bets(
+                profile,created_at,lottery,numbers,contest,amount,source,notes,
+                batch_id,batch_label,game_kind,creation_mode,blind_token,shares
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                profile, datetime.now().isoformat(timespec="seconds"), lottery, ",".join(map(str, numbers)),
+                str(contest or ""), float(amount), source, notes, batch_id, batch_label, game_kind,
+                creation_mode, blind_token, int(shares or 0),
+            ),
         )
         self.conn.commit()
 
     def list_bets(self, profile: str, lottery: str | None = None) -> pd.DataFrame:
         if not self.enabled:
             return pd.DataFrame()
-        query = "SELECT id,created_at,lottery,numbers,contest,amount,source,notes FROM bets WHERE profile=?"
+        query = "SELECT id,created_at,lottery,numbers,contest,amount,source,notes,batch_id,batch_label,game_kind,creation_mode,blind_token,shares FROM bets WHERE profile=?"
         params: list = [profile]
         if lottery:
             query += " AND lottery=?"
@@ -1423,7 +1448,14 @@ class LocalRepository:
         for row in payload.get("bets", []):
             nums = tuple(int(x) for x in str(row.get("numbers", "")).split(",") if str(x).strip())
             if nums:
-                self.add_bet(profile, str(row.get("lottery", "")), nums, str(row.get("contest", "")), float(row.get("amount", 0) or 0), str(row.get("source", "backup")), str(row.get("notes", "")))
+                self.add_bet(
+                    profile, str(row.get("lottery", "")), nums, str(row.get("contest", "")),
+                    float(row.get("amount", 0) or 0), str(row.get("source", "backup")), str(row.get("notes", "")),
+                    batch_id=str(row.get("batch_id", "") or ""), batch_label=str(row.get("batch_label", "") or ""),
+                    game_kind=str(row.get("game_kind", "Jogo único") or "Jogo único"),
+                    creation_mode=str(row.get("creation_mode", "Manual") or "Manual"),
+                    blind_token=str(row.get("blind_token", "") or ""), shares=int(row.get("shares", 0) or 0),
+                )
                 counts["bets"] += 1
         for row in payload.get("strategies", []):
             try:
@@ -1526,6 +1558,179 @@ def top_prize_probability(config: LotteryConfig, bet_size: int) -> tuple[float, 
     return probability, one_in
 
 
+
+def theoretical_game_metrics(game: Draw, config: LotteryConfig) -> dict[str, float | int]:
+    """Métricas puramente combinatórias. Não consulta nem recebe histórico de sorteios."""
+    n = len(game)
+    universe = np.array(config.universe, dtype=float)
+    N = config.universe_size
+    even_total = sum(v % 2 == 0 for v in config.universe)
+    odd_total = N - even_total
+    even_count = sum(v % 2 == 0 for v in game)
+
+    denom = math.comb(N, n) if 0 <= n <= N else 0
+    parity_ways = 0
+    if 0 <= even_count <= even_total and 0 <= n - even_count <= odd_total:
+        parity_ways = math.comb(even_total, even_count) * math.comb(odd_total, n - even_count)
+    parity_probability = parity_ways / denom if denom else 0.0
+
+    mean_number = float(universe.mean()) if len(universe) else 0.0
+    target_sum = n * mean_number
+    if N > 1 and n > 0:
+        pop_var = float(np.mean((universe - mean_number) ** 2))
+        sum_variance = n * pop_var * ((N - n) / (N - 1))
+        sum_sd = math.sqrt(max(0.0, sum_variance))
+    else:
+        sum_sd = 0.0
+    sum_z = (sum(game) - target_sum) / sum_sd if sum_sd > 0 else 0.0
+    bands = occupied_band_count(game, config)
+
+    expected_even = n * even_total / N if N else 0.0
+    parity_score = math.exp(-0.5 * ((even_count - expected_even) / max(1.0, math.sqrt(max(.25, n * .25)))) ** 2)
+    sum_score = math.exp(-0.5 * sum_z * sum_z)
+    band_target = min(6, n)
+    band_score = min(1.0, bands / max(1, band_target))
+    structural_score = 100.0 * (0.40 * parity_score + 0.40 * sum_score + 0.20 * band_score)
+
+    return {
+        "pares": even_count,
+        "impares": n - even_count,
+        "prob_paridade": parity_probability,
+        "soma": sum(game),
+        "soma_esperada": target_sum,
+        "z_soma": sum_z,
+        "faixas": bands,
+        "equilibrio_teorico": structural_score,
+    }
+
+
+def _validate_blind_inputs(
+    config: LotteryConfig,
+    bet_size: int,
+    required: Iterable[int],
+    excluded: Iterable[int],
+) -> tuple[set[int], set[int]]:
+    config.validate_bet_size(bet_size)
+    required_set = {int(x) for x in required}
+    excluded_set = {int(x) for x in excluded}
+    if required_set & excluded_set:
+        raise ValueError("Uma dezena não pode ser obrigatória e excluída ao mesmo tempo.")
+    if len(required_set) > bet_size:
+        raise ValueError("Há mais dezenas obrigatórias do que posições no jogo.")
+    if any(n not in config.universe for n in required_set | excluded_set):
+        raise ValueError("Há dezenas fora do universo da modalidade.")
+    available = [n for n in config.universe if n not in required_set and n not in excluded_set]
+    if len(available) < bet_size - len(required_set):
+        raise ValueError("As exclusões deixaram poucas dezenas disponíveis para montar o jogo.")
+    return required_set, excluded_set
+
+
+def generate_blind_games(
+    config: LotteryConfig,
+    count: int,
+    bet_size: int,
+    mode: str,
+    required: Iterable[int] = (),
+    excluded: Iterable[int] = (),
+    diversity: str = "Média",
+    seed: int | None = None,
+    max_attempts: int = 40000,
+) -> list[Draw]:
+    """Gera jogos sem receber histórico, resultado anterior ou frequências observadas.
+
+    Os modos 'Equilíbrio teórico' e 'Cobertura combinatória' usam apenas o universo
+    matemático da modalidade. Isso evita qualquer vazamento de resultado conhecido.
+    """
+    count = max(1, int(count))
+    required_set, excluded_set = _validate_blind_inputs(config, bet_size, required, excluded)
+    pool = [n for n in config.universe if n not in required_set and n not in excluded_set]
+    need = bet_size - len(required_set)
+    rng = random.Random(seed if seed is not None else secrets.randbits(63))
+    overlap_limits = {
+        "Baixa": bet_size,
+        "Média": max(1, math.ceil(bet_size * .70)),
+        "Alta": max(1, math.ceil(bet_size * .50)),
+    }
+    max_overlap = overlap_limits.get(diversity, bet_size)
+    results: list[Draw] = []
+    covered_pairs: set[tuple[int, int]] = set()
+    attempts = 0
+
+    def random_candidate() -> Draw:
+        return tuple(sorted(required_set | set(rng.sample(pool, need))))
+
+    while len(results) < count and attempts < max_attempts:
+        attempts += 1
+        if mode == "Aleatório puro":
+            candidate = random_candidate()
+        else:
+            candidate_pool: list[Draw] = []
+            for _ in range(220 if mode == "Equilíbrio teórico" else 320):
+                c = random_candidate()
+                if c not in candidate_pool:
+                    candidate_pool.append(c)
+            if not candidate_pool:
+                break
+
+            if mode == "Equilíbrio teórico":
+                candidate = max(
+                    candidate_pool,
+                    key=lambda c: theoretical_game_metrics(c, config)["equilibrio_teorico"],
+                )
+            elif mode == "Cobertura combinatória":
+                def coverage_score(c: Draw) -> tuple[int, float]:
+                    new_pairs = len(set(itertools.combinations(c, 2)) - covered_pairs)
+                    theoretical = float(theoretical_game_metrics(c, config)["equilibrio_teorico"])
+                    return new_pairs, theoretical
+                candidate = max(candidate_pool, key=coverage_score)
+            else:
+                raise ValueError("Modo automático desconhecido.")
+
+        if candidate in results:
+            continue
+        if diversity != "Baixa" and any(len(set(candidate) & set(old)) > max_overlap for old in results):
+            continue
+        results.append(candidate)
+        covered_pairs.update(itertools.combinations(candidate, 2))
+
+    return results
+
+
+def exact_hit_distribution(config: LotteryConfig, bet_size: int) -> pd.DataFrame:
+    """Distribuição hipergeométrica exata de acertos sem usar qualquer resultado real."""
+    config.validate_bet_size(bet_size)
+    N = config.universe_size
+    K = bet_size
+    n = config.drawn_count
+    denom = math.comb(N, n)
+    min_hits = max(0, n - (N - K))
+    max_hits = min(K, n)
+    rows = []
+    for hits in range(min_hits, max_hits + 1):
+        ways = math.comb(K, hits) * math.comb(N - K, n - hits)
+        prob = ways / denom if denom else 0.0
+        rows.append({
+            "Acertos": hits,
+            "Probabilidade %": prob * 100,
+            "1 em": (1 / prob) if prob > 0 else float("inf"),
+        })
+    return pd.DataFrame(rows)
+
+
+def theoretical_probability_summary(config: LotteryConfig, bet_size: int) -> dict[str, float]:
+    config.validate_bet_size(bet_size)
+    probability, one_in = top_prize_probability(config, bet_size)
+    even_total = sum(n % 2 == 0 for n in config.universe)
+    expected_even = bet_size * even_total / config.universe_size
+    expected_sum = bet_size * (config.number_min + config.number_max) / 2
+    return {
+        "prob_top": probability,
+        "one_in_top": one_in,
+        "expected_even": expected_even,
+        "expected_sum": expected_sum,
+        "possible_bets": float(math.comb(config.universe_size, bet_size)),
+    }
+
 def currency_br(value: float) -> str:
     text = f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {text}"
@@ -1553,7 +1758,13 @@ def maybe_authenticate() -> None:
 
 def data_source_controls(lottery_name: str, config: LotteryConfig) -> LoadReport | None:
     st.sidebar.markdown("### 📚 Base de dados")
-    source = st.sidebar.radio("Fonte", ["Dados oficiais CAIXA", "Arquivo CSV/Excel", "Simulação"], key="source_mode")
+    blind_active = bool(st.session_state.get("blind_creation_mode", False))
+    source_options = ["Arquivo CSV/Excel", "Simulação"] if blind_active else ["Dados oficiais CAIXA", "Arquivo CSV/Excel", "Simulação"]
+    if st.session_state.get("source_mode") not in source_options:
+        st.session_state["source_mode"] = source_options[0]
+    source = st.sidebar.radio("Fonte", source_options, key="source_mode")
+    if blind_active:
+        st.sidebar.caption("🔒 Modo cego ativo: a sincronização oficial fica desabilitada até os resultados serem reativados.")
 
     if source == "Dados oficiais CAIXA":
         st.sidebar.caption("O último resultado é consultado automaticamente com 1 chamada. O controle abaixo sincroniza o histórico usado nas análises.")
@@ -1646,6 +1857,65 @@ def cached_load_file(data: bytes, filename: str, lottery_name: str) -> LoadRepor
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_latest_official(lottery_name: str) -> OfficialContest:
     return fetch_official_contest(LOTTERIES[lottery_name])
+
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_specific_official(lottery_name: str, contest: int) -> OfficialContest:
+    return fetch_official_contest(LOTTERIES[lottery_name], int(contest))
+
+
+def blind_creation_active() -> bool:
+    return bool(st.session_state.get("blind_creation_mode", False))
+
+
+def activate_blind_creation_mode(results: dict[str, dict] | None = None) -> None:
+    """Oculta resultados e cria uma sessão de geração que não recebe dados oficiais."""
+    target_contests: dict[str, int] = {}
+    for name, payload in (results or {}).items():
+        if isinstance(payload, dict) and not payload.get("_error"):
+            try:
+                nxt = int(payload.get("numeroConcursoProximo") or 0)
+            except (TypeError, ValueError):
+                nxt = 0
+            if nxt > 0:
+                target_contests[name] = nxt
+    st.session_state.blind_creation_mode = True
+    st.session_state.blind_token = secrets.token_hex(12)
+    st.session_state.blind_started_at = datetime.now().isoformat(timespec="seconds")
+    st.session_state.blind_target_contests = target_contests
+    st.session_state.pop("latest_official_result", None)
+    st.session_state.pop("generated_games", None)
+    st.session_state.pop("blind_generated_games", None)
+    report = st.session_state.get("load_report")
+    if report is not None and getattr(report, "source_kind", "") == "oficial":
+        st.session_state.pop("load_report", None)
+    # Limpa caches que carregam resultados. O modo cego não chama essas funções.
+    cached_latest_official.clear()
+    cached_all_official_results.clear()
+    cached_recent_generic_results.clear()
+    cached_specific_official.clear()
+    cached_official.clear()
+
+
+def revoke_blind_creation_mode(reason: str = "") -> None:
+    st.session_state.blind_creation_mode = False
+    st.session_state.pop("blind_token", None)
+    st.session_state.pop("blind_started_at", None)
+    st.session_state.pop("blind_target_contests", None)
+    st.session_state.pop("blind_generated_games", None)
+    if reason:
+        st.session_state.last_blind_lock_reason = reason
+
+
+def blind_mode_banner() -> None:
+    token = str(st.session_state.get("blind_token", ""))
+    started = str(st.session_state.get("blind_started_at", ""))
+    short = token[:8] if token else "—"
+    st.success(
+        f"🔒 **Modo cego ativo.** Resultados oficiais estão ocultos e a geração automática não recebe histórico da CAIXA. "
+        f"Sessão `{short}` iniciada em {started.replace('T', ' ') if started else '—'}."
+    )
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1826,21 +2096,46 @@ def official_result_card_html(name: str, payload: dict, accent: str) -> str:
 
 def render_all_official_results() -> None:
     st.markdown("## 🎰 Resultados oficiais das Loterias CAIXA")
-    st.caption("Último concurso disponível de cada modalidade. Atualização automática com cache de 5 minutos.")
-    _, header_right = st.columns([5, 1])
-    with header_right:
-        if st.button("↻ Atualizar todos", use_container_width=True, key="refresh_all_caixa"):
-            cached_all_official_results.clear()
-            cached_latest_official.clear()
-            st.rerun()
 
+    if blind_creation_active():
+        st.markdown(
+            """<div class="hero-card"><div class="kpi-label">MODO CEGO DE CRIAÇÃO</div>
+            <h2 style="margin:.2rem 0 .35rem">Resultados zerados/ocultos nesta sessão</h2>
+            <div style="opacity:.76">Nenhuma dezena oficial é carregada enquanto este modo estiver ativo. Isso mantém a criação automática isolada dos resultados já conhecidos.</div></div>""",
+            unsafe_allow_html=True,
+        )
+        blind_mode_banner()
+        targets = st.session_state.get("blind_target_contests", {})
+        if targets:
+            st.caption("Somente os números dos próximos concursos foram preservados como metadados; nenhuma dezena sorteada foi mantida para a geração.")
+            st.dataframe(pd.DataFrame([{"Modalidade": k, "Próximo concurso": v} for k, v in targets.items()]), hide_index=True, use_container_width=True)
+        if st.button("🔓 Recarregar resultados CAIXA e bloquear nova geração", type="primary", use_container_width=True):
+            revoke_blind_creation_mode("Resultados CAIXA reativados")
+            st.rerun()
+        return
+
+    st.caption("Último concurso disponível de cada modalidade. Enquanto estes resultados estiverem visíveis, a criação automática permanece bloqueada.")
     with st.spinner("Consultando os resultados oficiais da CAIXA..."):
         results = cached_all_official_results()
 
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        if st.button("↻ Atualizar todos", use_container_width=True, key="refresh_all_caixa"):
+            cached_all_official_results.clear()
+            cached_latest_official.clear()
+            cached_specific_official.clear()
+            st.rerun()
+    with b2:
+        if st.button("🧹 Zerar/ocultar resultados e liberar criação automática", type="primary", use_container_width=True, key="zero_caixa_results"):
+            activate_blind_creation_mode(results)
+            st.rerun()
+
+    st.info("Para impedir geração retroativa, jogos automáticos só podem ser criados depois de usar **Zerar/ocultar resultados** acima. Ao consultar resultados novamente ou conferir jogos, a trava é reativada.")
+
     names = list(OFFICIAL_RESULT_GAMES)
-    for start in range(0, len(names), 3):
+    for start_idx in range(0, len(names), 3):
         cols = st.columns(3)
-        for col, name in zip(cols, names[start:start+3]):
+        for col, name in zip(cols, names[start_idx:start_idx+3]):
             meta = OFFICIAL_RESULT_GAMES[name]
             payload = results.get(name, {"_error": "sem resposta"})
             with col:
@@ -1860,9 +2155,8 @@ def render_all_official_results() -> None:
                             st.caption(f"Arrecadação: {currency_br(revenue)}")
 
     st.caption("Fonte: Portal Loterias/CAIXA. Algumas modalidades possuem elementos próprios, como segundo sorteio, trevos, Mês da Sorte ou Time do Coração.")
-
     st.markdown("### 🗓️ Últimos concursos")
-    st.caption("Consulte resultados anteriores diretamente na CAIXA sem carregar toda a base analítica.")
+    st.caption("Abrir o histórico mantém a criação automática bloqueada, pois resultados reais ficam disponíveis na sessão.")
     h1, h2, h3 = st.columns([2.2, 1, 1.1])
     history_name = h1.selectbox("Modalidade", names, key="official_history_game")
     history_qty = h2.selectbox("Quantidade", [5, 10, 20, 30, 50], index=1, key="official_history_qty")
@@ -1878,10 +2172,7 @@ def render_all_official_results() -> None:
             rows = []
             for item in history:
                 nums = item.get("listaDezenas") or []
-                if history_name == "Super Sete":
-                    result_text = "  ".join(_display_number(v, 1) for v in nums)
-                else:
-                    result_text = "  ".join(_display_number(v, 2) for v in nums)
+                result_text = "  ".join(_display_number(v, 1 if history_name == "Super Sete" else 2) for v in nums)
                 second = item.get("listaDezenasSegundoSorteio") or []
                 if second:
                     result_text += "  |  2º: " + "  ".join(_display_number(v, 2) for v in second)
@@ -1894,8 +2185,7 @@ def render_all_official_results() -> None:
                     "Resultado": result_text,
                     "Situação": "Acumulou" if bool(item.get("acumulado", False)) else "Teve ganhador",
                 })
-            history_df = pd.DataFrame(rows)
-            st.dataframe(history_df, hide_index=True, use_container_width=True, height=min(520, 38 * len(history_df) + 40))
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=min(520, 38 * len(rows) + 40))
 
 
 def render_latest_official_card(lottery_name: str, config: LotteryConfig) -> None:
@@ -1966,18 +2256,76 @@ def cached_backtest(
     )
 
 
+
+def _parse_target_contest(value: object) -> int | None:
+    try:
+        n = int(str(value or "").strip())
+        return n if n > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def automatic_wallet_check(bets: pd.DataFrame) -> pd.DataFrame:
+    """Confere cada jogo contra o concurso alvo salvo. Consultas são cacheadas por concurso."""
+    if bets.empty:
+        return pd.DataFrame()
+    official_cache: dict[tuple[str, int], OfficialContest | Exception] = {}
+    rows: list[dict] = []
+    for _, row in bets.iterrows():
+        lottery = str(row.get("lottery", ""))
+        cfg = LOTTERIES.get(lottery)
+        target = _parse_target_contest(row.get("contest"))
+        nums = tuple(sorted(int(x) for x in str(row.get("numbers", "")).split(",") if str(x).strip()))
+        base = {
+            "ID": int(row.get("id", 0)),
+            "Grupo": str(row.get("batch_label", "") or "") or str(row.get("batch_id", "") or "")[:8],
+            "Tipo": str(row.get("game_kind", "Jogo único") or "Jogo único"),
+            "Criação": str(row.get("creation_mode", row.get("source", "")) or ""),
+            "Loteria": lottery,
+            "Concurso": target or "—",
+            "Números": " - ".join(cfg.format_number(n) for n in nums) if cfg else " - ".join(map(str, nums)),
+        }
+        if cfg is None or target is None:
+            rows.append({**base, "Resultado": "—", "Acertos": "—", "Erros": "—", "Status": "Sem concurso alvo"})
+            continue
+        key = (lottery, target)
+        if key not in official_cache:
+            try:
+                official_cache[key] = cached_specific_official(lottery, target)
+            except Exception as exc:
+                official_cache[key] = exc
+        official = official_cache[key]
+        if isinstance(official, Exception):
+            rows.append({**base, "Resultado": "—", "Acertos": "—", "Erros": "—", "Status": "Aguardando resultado / indisponível"})
+            continue
+        result_set = set(official.draw)
+        hits = sorted(set(nums) & result_set)
+        misses = sorted(set(nums) - result_set)
+        rows.append({
+            **base,
+            "Resultado": " - ".join(cfg.format_number(n) for n in official.draw),
+            "Acertos": len(hits),
+            "Erros": len(misses),
+            "Status": f"Conferido em {official.draw_date}",
+        })
+    return pd.DataFrame(rows)
+
+
 def reset_lottery_state(lottery_name: str) -> None:
     st.session_state.current_lottery = lottery_name
     for key in [
         "load_report", "file_fingerprint", "bet_history", "backtest_result", "generated_games",
-        "closure_games", "checker_result", "ocr_text", "latest_official_result", "strategy_comparison", "mc_result", "api_health"
+        "closure_games", "checker_result", "ocr_text", "latest_official_result", "strategy_comparison", "mc_result", "api_health", "blind_generated_games", "blind_projection",
+        "manual_kind", "manual_size", "manual_single_numbers", "manual_pool_name", "manual_pool_shares", "manual_pool_games",
+        "auto_kind", "auto_mode", "auto_size", "auto_target_contest", "auto_qty", "auto_diversity", "auto_required", "auto_excluded",
+        "auto_pool_label", "auto_pool_shares", "blind_seed_enabled", "blind_seed", "prob_no_history_size", "blind_mc_sims", "blind_mc_seed"
     ]:
         st.session_state.pop(key, None)
 
 
 # ===== Streamlit UI =====
 st.set_page_config(
-    page_title="Loterias Lab V3.3",
+    page_title="Loterias Lab V3.4",
     page_icon="🍀",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -2004,7 +2352,7 @@ CUSTOM_CSS = """
   [data-testid="stMetric"] {padding:10px;}
 }
 
-/* V3.3 - cards corrigidos e historico oficial */
+/* V3.4 - cards, modo cego e criacao auditavel */
 [data-testid="stMetric"] {position:relative;overflow:hidden;box-shadow:0 8px 24px rgba(15,23,42,.045);transition:transform .18s ease, box-shadow .18s ease;}
 [data-testid="stMetric"]:hover {transform:translateY(-2px);box-shadow:0 12px 30px rgba(15,23,42,.09);}
 .info-card {position:relative;min-height:132px;padding:17px 18px;border:1px solid rgba(128,128,128,.16);border-radius:20px;background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 9%, transparent),rgba(255,255,255,.02));box-shadow:0 9px 26px rgba(15,23,42,.055);overflow:hidden;}
@@ -2054,7 +2402,7 @@ st.sidebar.divider()
 page = st.sidebar.radio(
     "Navegação",
     [
-        "🎰 Resultados CAIXA", "🏠 Dashboard", "🔥 Frequências", "🧩 Padrões", "🕸️ Rede", "🎯 Gerador",
+        "🎰 Resultados CAIXA", "🏠 Dashboard", "🔥 Frequências", "🧩 Padrões", "🕸️ Rede", "🎟️ Criar Jogos",
         "🧮 Fechamentos", "🧪 Laboratório", "💼 Meus Jogos", "✅ Conferidor & OCR",
         "💰 Orçamento", "🗂️ Dados", "❓ FAQ",
     ],
@@ -2065,17 +2413,19 @@ st.sidebar.caption("Os recursos estatísticos descrevem padrões passados. Eles 
 
 st.markdown(
     f"""<div class="hero-card"><div class="kpi-label">{html.escape(lottery_name)}</div>
-    <h1 style="margin:.15rem 0 .2rem">Loterias Lab V3.3</h1>
+    <h1 style="margin:.15rem 0 .2rem">Loterias Lab V3.4</h1>
     <div style="opacity:.76">Análise histórica, geração por restrições, backtests, Monte Carlo, fechamentos, conferência e gestão de jogos.</div></div>""",
     unsafe_allow_html=True,
 )
 
-# Resultado da modalidade selecionada continua disponível nas páginas analíticas.
-if page != "🎰 Resultados CAIXA":
+# Resultado da modalidade selecionada só aparece fora do modo cego.
+if page != "🎰 Resultados CAIXA" and not blind_creation_active():
     render_latest_official_card(lottery_name, config)
+elif page != "🎰 Resultados CAIXA" and blind_creation_active():
+    blind_mode_banner()
 
 # Resultados gerais e FAQ funcionam mesmo sem histórico sincronizado.
-if page not in {"❓ FAQ", "🎰 Resultados CAIXA"} and (report is None or not report.draws):
+if page not in {"❓ FAQ", "🎰 Resultados CAIXA", "🎟️ Criar Jogos", "🧮 Fechamentos", "💼 Meus Jogos", "✅ Conferidor & OCR", "💰 Orçamento"} and (report is None or not report.draws):
     st.info("Carregue dados oficiais, um arquivo ou uma simulação na barra lateral para liberar as análises.")
     st.stop()
 
@@ -2253,135 +2603,207 @@ elif page == "🕸️ Rede":
     with col2:
         st.plotly_chart(network_figure(edges, config), use_container_width=True)
     st.caption("Uma conexão forte só descreve coocorrência passada. Não implica dependência causal ou vantagem de previsão.")
-elif page == "🎯 Gerador":
-    st.markdown("## Gerador avançado de combinações")
-    mode = st.radio("Modo", ["Aleatório", "Perfil histórico", "Personalizado"], horizontal=True)
-    bet_size = st.slider("Números por aposta", config.bet_min, config.bet_max, config.bet_default)
-    games_qty = st.slider("Quantidade de jogos", 1, 60, 10)
-    diversity = st.select_slider("Diversidade entre jogos", options=["Baixa", "Média", "Alta"], value="Média")
+elif page == "🎟️ Criar Jogos":
+    st.markdown("## 🎟️ Criar jogos únicos e bolões")
+    st.caption("Jogos manuais podem ser registrados a qualquer momento. Jogos automáticos exigem o modo cego, no qual o motor não recebe resultados oficiais nem histórico de sorteios.")
 
-    groups = analytics.groups()
-    hot_count = 0
-    cold_count = 0
-    if mode == "Perfil histórico":
-        max_hot = min(len(groups.hot), bet_size)
-        hot_count = st.slider("Mais frequentes", 0, max_hot, min(max_hot, round(bet_size * .4)))
-        max_cold = min(len(groups.cold), bet_size - hot_count)
-        cold_count = st.slider("Menos frequentes", 0, max_cold, min(max_cold, round(bet_size * .2)))
-        st.caption(f"Neutros: {bet_size-hot_count-cold_count}")
+    tab_manual, tab_auto, tab_prob = st.tabs(["✍️ Manual", "🤖 Automático / Bolão", "📐 Probabilidade sem histórico"])
 
-    required_text = st.text_input("Números obrigatórios", placeholder="Ex.: 05 12 27")
-    excluded_text = st.text_input("Números excluídos", placeholder="Ex.: 03 41")
-    required = parse_numbers(required_text, config)
-    excluded = parse_numbers(excluded_text, config)
+    with tab_manual:
+        st.markdown("### Criação manual")
+        m1, m2, m3 = st.columns([1.2, 1, 1])
+        manual_kind = m1.radio("Tipo", ["Jogo único", "Bolão"], horizontal=True, key="manual_kind")
+        manual_size = m2.slider("Números por jogo", config.bet_min, config.bet_max, config.bet_default, key="manual_size")
+        manual_contest = int(m3.number_input("Concurso alvo", min_value=0, value=0, step=1, help="Informe o concurso que este jogo pretende disputar. Isso permite conferência automática depois."))
+        batch_label = ""
+        shares = 0
+        manual_games: list[Draw] = []
 
-    with st.expander("Filtros avançados", expanded=(mode == "Personalizado")):
-        ev_default = bet_size // 2
-        even_min, even_max = st.slider("Quantidade de pares", 0, bet_size, (max(0, ev_default-1), min(bet_size, ev_default+1)))
-        historical_sums = analytics.sums()
-        theoretical_min = sum(sorted(config.universe)[:bet_size])
-        theoretical_max = sum(sorted(config.universe, reverse=True)[:bet_size])
-        if len(historical_sums):
-            q10 = int(max(theoretical_min, historical_sums.quantile(.10)))
-            q90 = int(min(theoretical_max, historical_sums.quantile(.90)))
+        if manual_kind == "Jogo único":
+            txt = st.text_input("Dezenas do jogo", placeholder=f"Informe exatamente {manual_size} dezenas", key="manual_single_numbers")
+            nums = parse_numbers(txt, config)
+            if nums:
+                st.caption(f"Reconhecidas {len(nums)}/{manual_size}: " + " ".join(config.format_number(n) for n in nums))
+            if len(nums) == manual_size:
+                manual_games = [tuple(sorted(nums))]
         else:
-            q10, q90 = theoretical_min, theoretical_max
-        sum_min, sum_max = st.slider("Faixa de soma", theoretical_min, theoretical_max, (q10, q90))
-        max_consecutive = st.slider("Máximo de pares consecutivos", 0, max(1, bet_size-1), min(2, max(1, bet_size-1)))
-        max_repeats = st.slider("Máximo de repetidos do último concurso", 0, min(bet_size, config.drawn_count), min(2, min(bet_size, config.drawn_count)))
-        min_bands = st.slider("Mínimo de faixas ocupadas", 1, min(6, bet_size), min(4, min(6, bet_size)))
+            c1, c2 = st.columns([2, 1])
+            batch_label = c1.text_input("Nome do bolão", placeholder="Ex.: Bolão Família Setembro", key="manual_pool_name")
+            shares = int(c2.number_input("Cotas (opcional)", min_value=0, value=0, step=1, key="manual_pool_shares"))
+            pasted = st.text_area(
+                "Jogos do bolão — um por linha",
+                placeholder=f"Cada linha deve conter exatamente {manual_size} dezenas.",
+                height=180,
+                key="manual_pool_games",
+            )
+            manual_games = split_game_lines(pasted, config, manual_size)
+            nonempty_lines = len([line for line in pasted.splitlines() if line.strip()])
+            st.caption(f"{len(manual_games)} jogo(s) válido(s) em {nonempty_lines} linha(s) preenchida(s).")
 
-    seed_enabled = st.checkbox("Seed reproduzível", value=False)
-    gen_seed = st.number_input("Seed", value=42, step=1, disabled=not seed_enabled)
-    unit_price = config.bet_price(bet_size)
-    prob_top, one_in_top = top_prize_probability(config, bet_size)
-    st.caption(f"Preço oficial de referência para uma aposta deste tamanho: **{currency_br(unit_price)}**. Total estimado para {games_qty}: **{currency_br(unit_price*games_qty)}**.")
-    st.caption(f"Probabilidade matemática do prêmio máximo com uma aposta desse tamanho: aproximadamente **1 em {one_in_top:,.0f}** ({prob_top*100:.8f}%).".replace(",", "."))
+        notes = st.text_input("Observações", key="manual_create_notes")
+        register_budget = st.checkbox("Registrar custo no orçamento", key="manual_create_budget")
+        if manual_games:
+            unit = config.bet_price(manual_size)
+            st.info(f"Custo de referência: {currency_br(unit)} por jogo · total {currency_br(unit * len(manual_games))}.")
+            st.dataframe(pd.DataFrame({
+                "Jogo": range(1, len(manual_games)+1),
+                "Números": [" - ".join(config.format_number(n) for n in g) for g in manual_games],
+            }), hide_index=True, use_container_width=True)
 
-    cgen1, cgen2 = st.columns([.7, .3])
-    with cgen1:
-        generate_clicked = st.button("Gerar combinações", type="primary", use_container_width=True)
-    with cgen2:
-        if st.button("Limpar geração", use_container_width=True):
-            st.session_state.generated_games = []
+        if st.button("Salvar jogo/bolão manual", type="primary", use_container_width=True, disabled=not bool(manual_games)):
+            if manual_contest <= 0:
+                st.error("Informe o concurso alvo para permitir a conferência automática futura.")
+            else:
+                batch_id = secrets.token_hex(6)
+                unit = config.bet_price(manual_size)
+                for game in manual_games:
+                    REPO.add_bet(
+                        profile, lottery_name, game, str(manual_contest), unit, "manual", notes,
+                        batch_id=batch_id, batch_label=batch_label, game_kind=manual_kind,
+                        creation_mode="Manual", shares=shares,
+                    )
+                if register_budget:
+                    REPO.add_budget(profile, "Aposta", unit * len(manual_games), lottery_name, f"{manual_kind} manual · concurso {manual_contest}")
+                st.success(f"{len(manual_games)} jogo(s) manual(is) salvo(s) para o concurso {manual_contest}.")
 
-    if generate_clicked:
-        try:
-            with st.spinner("Gerando combinações e aplicando filtros..."):
-                games = generate_custom_bets(
-                    config=config,
-                    count=games_qty,
-                    bet_size=bet_size,
-                    mode=mode,
-                    analytics=analytics,
-                    hot_count=hot_count,
-                    cold_count=cold_count,
-                    required=required,
-                    excluded=excluded,
-                    diversity=diversity,
-                    even_min=even_min,
-                    even_max=even_max,
-                    sum_min=sum_min,
-                    sum_max=sum_max,
-                    max_consecutive=max_consecutive,
-                    max_repeats=max_repeats,
-                    min_bands=min_bands,
-                    seed=int(gen_seed) if seed_enabled else None,
-                )
-                st.session_state.generated_games = games
-            if len(games) < games_qty:
-                st.warning(f"Foram encontradas {len(games)} combinações que atendem a todos os filtros. Afrouxe os filtros para gerar mais.")
-        except Exception as exc:
-            st.error(str(exc))
+    with tab_auto:
+        st.markdown("### Criação automática protegida")
+        if not blind_creation_active():
+            st.error("🔒 **Criação automática bloqueada.** Os resultados CAIXA estão disponíveis nesta sessão.")
+            st.markdown(
+                "1. Abra **🎰 Resultados CAIXA**.  \n"
+                "2. Clique em **Zerar/ocultar resultados e liberar criação automática**.  \n"
+                "3. Volte aqui. O gerador passará a operar sem receber resultados oficiais ou histórico."
+            )
+            st.warning("A trava existe para impedir que um jogo seja criado depois de o resultado já ser conhecido e pareça ter sido previsto retroativamente.")
+        else:
+            blind_mode_banner()
+            token = str(st.session_state.get("blind_token", ""))
+            targets = st.session_state.get("blind_target_contests", {})
+            default_target = int(targets.get(lottery_name, 0) or 0)
 
-    games = st.session_state.get("generated_games", [])
-    if games:
-        coverage = coverage_metrics(games)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Jogos gerados", len(games))
-        m2.metric("Cobertura de pares", f"{coverage['pair_coverage']*100:.1f}%")
-        m3.metric("Cobertura de trios", f"{coverage['triple_coverage']*100:.1f}%")
-        m4.metric("Custo estimado", currency_br(unit_price*len(games)))
+            a1, a2, a3, a4 = st.columns([1.1, 1, 1, 1])
+            auto_kind = a1.radio("Tipo", ["Jogo único", "Bolão"], horizontal=True, key="auto_kind")
+            auto_mode = a2.selectbox("Método", ["Aleatório puro", "Equilíbrio teórico", "Cobertura combinatória"], key="auto_mode")
+            auto_size = a3.slider("Números por jogo", config.bet_min, config.bet_max, config.bet_default, key="auto_size")
+            auto_contest = int(a4.number_input("Concurso alvo", min_value=0, value=default_target, step=1, key="auto_target_contest"))
+            auto_qty = 1 if auto_kind == "Jogo único" else st.slider("Quantidade de jogos no bolão", 2, 100, 10, key="auto_qty")
+            diversity = st.select_slider("Diversidade entre jogos", options=["Baixa", "Média", "Alta"], value="Média", key="auto_diversity")
 
-        selected_index = st.selectbox("Analisar jogo", range(1, len(games)+1), format_func=lambda x: f"Jogo {x}")
-        render_bet_profile(games[selected_index-1], analytics, config)
+            r1, r2 = st.columns(2)
+            required = parse_numbers(r1.text_input("Dezenas obrigatórias (opcional)", key="auto_required"), config)
+            excluded = parse_numbers(r2.text_input("Dezenas excluídas (opcional)", key="auto_excluded"), config)
+            auto_label = st.text_input("Nome do bolão (opcional)", key="auto_pool_label", disabled=auto_kind == "Jogo único")
+            auto_shares = int(st.number_input("Cotas do bolão (opcional)", min_value=0, value=0, step=1, key="auto_pool_shares", disabled=auto_kind == "Jogo único"))
+            seed_enabled = st.checkbox("Usar seed reproduzível", value=False, key="blind_seed_enabled")
+            auto_seed = int(st.number_input("Seed", value=42, step=1, key="blind_seed", disabled=not seed_enabled)) if seed_enabled else None
 
-        with st.expander("Ver todos os jogos", expanded=True):
-            rows = []
-            for i, game in enumerate(games, 1):
-                score, _ = analytics.balance_score(game, active_draws[-1] if active_draws else None)
-                rows.append({"Jogo": i, "Números": " - ".join(config.format_number(n) for n in game), "Equilíbrio": round(score, 1), "Pares": sum(n%2==0 for n in game), "Soma": sum(game)})
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            summary = theoretical_probability_summary(config, auto_size)
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Combinações possíveis", f"{int(summary['possible_bets']):,}".replace(",", "."))
+            p2.metric("Prêmio máximo", f"1 em {summary['one_in_top']:,.0f}".replace(",", "."))
+            p3.metric("Pares esperados", f"{summary['expected_even']:.2f}")
+            p4.metric("Soma esperada", f"{summary['expected_sum']:.1f}")
+            st.caption("Essas métricas vêm apenas do universo matemático da modalidade. Nenhum concurso real é lido pelo gerador.")
 
-        save_col1, save_col2 = st.columns(2)
-        with save_col1:
-            register_budget = st.checkbox("Registrar o valor no orçamento", value=False)
-            if st.button("Salvar todos em Meus Jogos", use_container_width=True):
-                add_games_to_wallet(games, profile, lottery_name, config, f"Gerador — {mode}", register_budget)
-                st.success("Jogos salvos.")
-        with save_col2:
-            strategy_name = st.text_input("Nome para favoritar esta estratégia", placeholder="Ex.: Equilibrada 3/2")
-            if st.button("Salvar estratégia favorita", use_container_width=True, disabled=not strategy_name.strip()):
-                payload = {
-                    "mode": mode, "bet_size": bet_size, "games_qty": games_qty, "diversity": diversity,
-                    "hot_count": hot_count, "cold_count": cold_count, "required": required, "excluded": excluded,
-                    "even_min": even_min, "even_max": even_max, "sum_min": sum_min, "sum_max": sum_max,
-                    "max_consecutive": max_consecutive, "max_repeats": max_repeats, "min_bands": min_bands,
-                }
-                REPO.save_strategy(profile, lottery_name, strategy_name.strip(), payload)
-                st.success("Estratégia salva nos favoritos.")
+            if st.button("Gerar em modo cego", type="primary", use_container_width=True, key="blind_generate"):
+                if auto_contest <= 0:
+                    st.error("Informe o concurso alvo antes de gerar, para que a conferência posterior seja auditável.")
+                else:
+                    try:
+                        with st.spinner("Gerando sem consultar resultados..."):
+                            games = generate_blind_games(
+                                config, auto_qty, auto_size, auto_mode, required, excluded,
+                                diversity, auto_seed,
+                            )
+                        st.session_state.blind_generated_games = {
+                            "games": games,
+                            "token": token,
+                            "contest": auto_contest,
+                            "kind": auto_kind,
+                            "mode": auto_mode,
+                            "label": auto_label,
+                            "shares": auto_shares,
+                            "size": auto_size,
+                        }
+                        if len(games) < auto_qty:
+                            st.warning(f"Foram gerados {len(games)} de {auto_qty} jogos. Aumente a sobreposição permitida ou reduza restrições.")
+                    except Exception as exc:
+                        st.error(str(exc))
 
-        csv_rows = pd.DataFrame({"jogo": range(1, len(games)+1), "numeros": [" - ".join(config.format_number(n) for n in g) for g in games]})
-        st.download_button("Baixar jogos (CSV)", csv_rows.to_csv(index=False).encode("utf-8-sig"), f"jogos_{config.slug}.csv", "text/csv", use_container_width=True)
+            payload = st.session_state.get("blind_generated_games") or {}
+            games = payload.get("games", []) if payload.get("token") == token else []
+            if games:
+                cov = coverage_metrics(games)
+                g1, g2, g3, g4 = st.columns(4)
+                g1.metric("Jogos", len(games))
+                g2.metric("Cobertura de pares", f"{cov['pair_coverage']*100:.1f}%")
+                g3.metric("Cobertura de trios", f"{cov['triple_coverage']*100:.1f}%")
+                g4.metric("Custo estimado", currency_br(config.bet_price(auto_size) * len(games)))
+                rows = []
+                for i, game in enumerate(games, 1):
+                    mt = theoretical_game_metrics(game, config)
+                    rows.append({
+                        "Jogo": i,
+                        "Números": " - ".join(config.format_number(n) for n in game),
+                        "Equilíbrio teórico": round(float(mt["equilibrio_teorico"]), 1),
+                        "Pares": int(mt["pares"]),
+                        "Soma": int(mt["soma"]),
+                        "Faixas": int(mt["faixas"]),
+                    })
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=min(520, 38 * len(rows) + 45))
+                st.caption(f"Selo de modo cego: `{token}`. Ele identifica que esta geração ocorreu com a visualização oficial zerada.")
+                reg_budget = st.checkbox("Registrar custo no orçamento", key="auto_save_budget")
+                if st.button("Salvar geração em Meus Jogos", use_container_width=True, key="save_blind_games"):
+                    batch_id = secrets.token_hex(6)
+                    unit = config.bet_price(auto_size)
+                    audit_note = f"Modo cego V3.4 · método {auto_mode} · selo {token}"
+                    for game in games:
+                        REPO.add_bet(
+                            profile, lottery_name, game, str(auto_contest), unit, "automatic", audit_note,
+                            batch_id=batch_id, batch_label=auto_label, game_kind=auto_kind,
+                            creation_mode="Automático", blind_token=token, shares=auto_shares,
+                        )
+                    if reg_budget:
+                        REPO.add_budget(profile, "Aposta", unit * len(games), lottery_name, f"{auto_kind} automático · concurso {auto_contest}")
+                    st.success(f"{len(games)} jogo(s) salvo(s) com selo de modo cego.")
 
-    favs = REPO.list_strategies(profile, lottery_name)
-    if not favs.empty:
-        st.markdown("### Estratégias favoritas")
-        fav_view = favs[["id", "name", "created_at"]].rename(columns={"id":"ID", "name":"Nome", "created_at":"Criada em"})
-        st.dataframe(fav_view, hide_index=True, use_container_width=True)
+    with tab_prob:
+        st.markdown("### Probabilidade e análise teórica — zero histórico")
+        st.write("Esta seção calcula probabilidades diretamente pela combinatória da modalidade e, por construção, não consulta a aba Resultados CAIXA nem a base analítica.")
+        prob_size = st.slider("Tamanho da aposta", config.bet_min, config.bet_max, config.bet_default, key="prob_no_history_size")
+        ps = theoretical_probability_summary(config, prob_size)
+        x1, x2, x3, x4 = st.columns(4)
+        x1.metric("Chance do prêmio máximo", f"{ps['prob_top']*100:.10f}%")
+        x2.metric("Equivalente", f"1 em {ps['one_in_top']:,.0f}".replace(",", "."))
+        x3.metric("Pares esperados", f"{ps['expected_even']:.2f}")
+        x4.metric("Soma esperada", f"{ps['expected_sum']:.1f}")
+        st.info("Todos os jogos válidos do mesmo tamanho têm a mesma probabilidade do prêmio máximo. O 'equilíbrio teórico' apenas descreve a estrutura do jogo; não aumenta sua chance matemática.")
+
+        st.markdown("#### Distribuição teórica de acertos")
+        exact_dist = exact_hit_distribution(config, prob_size)
+        exact_view = exact_dist.copy()
+        exact_view["Probabilidade %"] = exact_view["Probabilidade %"].map(lambda x: f"{x:.10f}%")
+        exact_view["1 em"] = exact_view["1 em"].map(lambda x: "—" if not math.isfinite(x) else f"{x:,.0f}".replace(",", "."))
+        st.dataframe(exact_view, hide_index=True, use_container_width=True)
+
+        st.markdown("#### Projeção probabilística cega (Monte Carlo)")
+        mc_sims_blind = st.select_slider("Simulações", options=[10000, 25000, 50000, 100000, 250000], value=50000, key="blind_mc_sims")
+        mc_seed_blind = int(st.number_input("Seed da projeção", value=42, step=1, key="blind_mc_seed"))
+        if st.button("Executar projeção sem histórico", key="run_blind_projection", use_container_width=True):
+            st.session_state.blind_projection = monte_carlo_hits(config, prob_size, int(mc_sims_blind), mc_seed_blind)
+        blind_projection = st.session_state.get("blind_projection")
+        if isinstance(blind_projection, pd.DataFrame) and not blind_projection.empty:
+            st.bar_chart(blind_projection.set_index("Acertos")[["Probabilidade simulada %"]])
+            st.dataframe(blind_projection, hide_index=True, use_container_width=True)
+            st.caption("A simulação sorteia resultados artificiais a partir do universo matemático. Nenhum resultado da CAIXA é consultado ou usado no cálculo.")
 
 elif page == "🧮 Fechamentos":
     st.markdown("## Fechamentos e desdobramentos")
+    if not blind_creation_active():
+        st.error("🔒 Fechamentos que criam apostas estão bloqueados enquanto resultados oficiais estiverem disponíveis. Zere/oculte a aba Resultados CAIXA primeiro.")
+        st.stop()
+    blind_mode_banner()
     st.write("Selecione um conjunto-base maior que a aposta e o algoritmo escolhe combinações buscando ampliar a cobertura de pares ou trios dentro do limite de jogos/orçamento.")
     bet_size = st.slider("Tamanho de cada jogo", config.bet_min, config.bet_max, config.bet_default, key="closure_bet_size")
     base_text = st.text_area("Números-base", placeholder=f"Informe mais de {bet_size} números separados por espaço, vírgula ou hífen.")
@@ -2519,42 +2941,52 @@ elif page == "🧪 Laboratório":
         st.caption("É um diagnóstico aproximado das frequências agregadas. Sorteios sem reposição têm dependências internas, então o resultado deve ser interpretado com cautela.")
 
 elif page == "💼 Meus Jogos":
-    st.markdown("## Carteira de jogos")
-    st.caption("Os dados são guardados em SQLite local quando possível. No Streamlit Cloud o armazenamento pode ser apagado em reinicializações ou novos deploys; use o backup para preservar informações importantes.")
-    bets=REPO.list_bets(profile)
+    st.markdown("## 💼 Meus Jogos — carteira e conferência automática")
+    st.caption("Jogos manuais e automáticos ficam juntos na carteira. Quando existe concurso alvo, o app consulta a CAIXA e calcula automaticamente acertos e erros.")
+    bets = REPO.list_bets(profile)
     if bets.empty:
-        st.info("Nenhum jogo salvo neste perfil.")
+        st.info("Nenhum jogo salvo neste perfil. Use **🎟️ Criar Jogos** para adicionar um jogo único ou bolão.")
     else:
-        view=bets.copy()
-        view["numbers"]=view.apply(lambda r: " - ".join(LOTTERIES[r["lottery"]].format_number(int(x)) for x in str(r["numbers"]).split(",")),axis=1)
-        view=view.rename(columns={"id":"ID","created_at":"Data","lottery":"Loteria","numbers":"Números","contest":"Concurso","amount":"Valor","source":"Origem","notes":"Observações"})
-        st.dataframe(view,hide_index=True,use_container_width=True,height=500)
-        ids=bets["id"].astype(int).tolist()
-        delete_id=st.selectbox("Excluir jogo",ids,format_func=lambda x:f"ID {x}")
+        targets = bets["contest"].map(_parse_target_contest) if "contest" in bets else pd.Series(dtype=object)
+        has_targets = any(x is not None for x in targets.tolist())
+        if has_targets:
+            if blind_creation_active():
+                revoke_blind_creation_mode("Conferência automática da carteira")
+                st.warning("A conferência automática consultou resultados oficiais. Por integridade, a criação automática foi bloqueada novamente.")
+            with st.spinner("Conferindo concursos-alvo na CAIXA..."):
+                checked_wallet = automatic_wallet_check(bets)
+            if not checked_wallet.empty:
+                st.markdown("### ✅ Conferência automática")
+                numeric_hits = pd.to_numeric(checked_wallet["Acertos"], errors="coerce")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Jogos salvos", len(checked_wallet))
+                c2.metric("Já conferidos", int(numeric_hits.notna().sum()))
+                c3.metric("Melhor acerto", int(numeric_hits.max()) if numeric_hits.notna().any() else 0)
+                c4.metric("Aguardando", int((checked_wallet["Status"].str.contains("Aguardando", na=False)).sum()))
+                st.dataframe(checked_wallet, hide_index=True, use_container_width=True, height=min(620, 38 * len(checked_wallet) + 45))
+
+        st.markdown("### Carteira cadastrada")
+        view = bets.copy()
+        def fmt_numbers(r):
+            cfg = LOTTERIES.get(str(r["lottery"]))
+            return " - ".join((cfg.format_number(int(x)) if cfg else str(x)) for x in str(r["numbers"]).split(",") if str(x).strip())
+        view["numbers"] = view.apply(fmt_numbers, axis=1)
+        columns = ["id","created_at","lottery","game_kind","creation_mode","batch_label","numbers","contest","amount","blind_token","notes"]
+        view = view[[c for c in columns if c in view.columns]].rename(columns={
+            "id":"ID","created_at":"Data","lottery":"Loteria","game_kind":"Tipo","creation_mode":"Criação",
+            "batch_label":"Bolão/Grupo","numbers":"Números","contest":"Concurso alvo","amount":"Valor",
+            "blind_token":"Selo cego","notes":"Observações",
+        })
+        st.dataframe(view, hide_index=True, use_container_width=True, height=460)
+        ids = bets["id"].astype(int).tolist()
+        delete_id = st.selectbox("Excluir jogo", ids, format_func=lambda x:f"ID {x}")
         if st.button("Excluir selecionado"):
             REPO.delete_bet(delete_id)
             st.success("Jogo excluído.")
             st.rerun()
 
-    st.markdown("### Adicionar jogo manualmente")
-    manual=st.text_input("Números",placeholder="Ex.: 05 12 23 34 41 58")
-    manual_nums=parse_numbers(manual,config)
-    contest=st.text_input("Concurso (opcional)")
-    notes=st.text_input("Observações",key="manual_notes")
-    register=st.checkbox("Registrar o valor da aposta no orçamento",key="manual_budget")
-    if st.button("Salvar jogo manual",type="primary"):
-        try:
-            config.validate_bet_size(len(manual_nums))
-            game=tuple(sorted(manual_nums))
-            REPO.add_bet(profile,lottery_name,game,contest,config.bet_price(len(game)),"manual",notes)
-            if register:
-                REPO.add_budget(profile,"Aposta",config.bet_price(len(game)),lottery_name,f"Jogo manual {contest}".strip())
-            st.success("Jogo salvo.")
-        except Exception as exc:
-            st.error(str(exc))
-
     st.markdown("### Backup do perfil")
-    st.download_button("Baixar backup JSON",REPO.export_backup(profile),f"backup_loterias_lab_{re.sub(r'[^a-zA-Z0-9_-]+','_',profile)}.json","application/json",use_container_width=True)
+    st.download_button("Baixar backup JSON", REPO.export_backup(profile), f"backup_loterias_lab_{re.sub(r'[^a-zA-Z0-9_-]+','_',profile)}.json", "application/json", use_container_width=True)
     backup_file = st.file_uploader("Restaurar backup JSON", type=["json"], key="backup_restore")
     if backup_file is not None and st.button("Importar backup", key="backup_import"):
         try:
@@ -2565,75 +2997,109 @@ elif page == "💼 Meus Jogos":
             st.error(f"Backup inválido: {exc}")
 
 elif page == "✅ Conferidor & OCR":
-    st.markdown("## Conferidor de jogos")
-    result_source=st.radio("Resultado",["Digitar resultado","Último resultado oficial"],horizontal=True)
-    result_nums=[]
-    if result_source=="Digitar resultado":
-        result_text=st.text_input("Dezenas sorteadas",placeholder=f"Informe {config.drawn_count} dezenas")
-        result_nums=parse_numbers(result_text,config)
-    else:
-        if st.button("Buscar último resultado da CAIXA",type="primary"):
+    st.markdown("## ✅ Conferidor de jogos")
+    st.caption("Você pode conferir um resultado digitado, um concurso específico da CAIXA ou o último concurso. Consultar a CAIXA bloqueia novamente a criação automática.")
+    result_source = st.radio("Resultado", ["Concurso específico CAIXA", "Último resultado oficial", "Digitar resultado"], horizontal=True)
+    result_nums: list[int] = []
+    result_contest: int | None = None
+
+    if result_source == "Digitar resultado":
+        result_text = st.text_input("Dezenas sorteadas", placeholder=f"Informe {config.drawn_count} dezenas")
+        result_nums = parse_numbers(result_text, config)
+    elif result_source == "Concurso específico CAIXA":
+        requested = int(st.number_input("Número do concurso", min_value=1, value=1, step=1, key="checker_contest"))
+        if st.button("Buscar concurso na CAIXA", type="primary"):
+            if blind_creation_active():
+                revoke_blind_creation_mode("Consulta de resultado no conferidor")
             try:
-                official = fetch_official_contest(config)
-                st.session_state.latest_official_result=(official.contest,official.draw)
+                official = cached_specific_official(lottery_name, requested)
+                st.session_state.latest_official_result = (official.contest, official.draw)
             except Exception as exc:
                 st.error(f"Falha ao consultar: {exc}")
-        latest_data=st.session_state.get("latest_official_result")
+        latest_data = st.session_state.get("latest_official_result")
         if latest_data:
-            latest,draw=latest_data
-            st.success(f"Concurso {latest}")
-            st.markdown(balls_html(draw,config),unsafe_allow_html=True)
-            result_nums=list(draw)
-
-    input_mode=st.radio("Jogos para conferir",["Carteira salva","Colar jogos","Foto/OCR"],horizontal=True)
-    games_to_check=[]
-    if input_mode=="Carteira salva":
-        games_to_check=[g for _,g,_ in get_saved_bets(profile,lottery_name,config)]
-        st.caption(f"{len(games_to_check)} jogo(s) encontrados na carteira desta modalidade.")
-    elif input_mode=="Colar jogos":
-        pasted=st.text_area("Cole um jogo por linha")
-        games_to_check=split_game_lines(pasted,config,None)
-        st.caption(f"{len(games_to_check)} linha(s) reconhecida(s) como apostas válidas.")
+            result_contest, draw = latest_data
+            st.success(f"Concurso {result_contest}")
+            st.markdown(balls_html(draw, config), unsafe_allow_html=True)
+            result_nums = list(draw)
     else:
-        image_file=st.file_uploader("Foto do volante/comprovante",type=["png","jpg","jpeg","webp"])
+        if st.button("Buscar último resultado da CAIXA", type="primary"):
+            if blind_creation_active():
+                revoke_blind_creation_mode("Consulta do último resultado no conferidor")
+            try:
+                official = cached_latest_official(lottery_name)
+                st.session_state.latest_official_result = (official.contest, official.draw)
+            except Exception as exc:
+                st.error(f"Falha ao consultar: {exc}")
+        latest_data = st.session_state.get("latest_official_result")
+        if latest_data:
+            result_contest, draw = latest_data
+            st.success(f"Concurso {result_contest}")
+            st.markdown(balls_html(draw, config), unsafe_allow_html=True)
+            result_nums = list(draw)
+
+    input_mode = st.radio("Jogos para conferir", ["Carteira salva", "Colar jogos", "Foto/OCR"], horizontal=True)
+    games_meta: list[tuple[Draw, dict]] = []
+    if input_mode == "Carteira salva":
+        saved = get_saved_bets(profile, lottery_name, config)
+        for _, game, meta in saved:
+            if result_contest is None or _parse_target_contest(meta.get("contest")) in {None, result_contest}:
+                games_meta.append((game, meta))
+        st.caption(f"{len(games_meta)} jogo(s) da carteira disponíveis para esta conferência.")
+    elif input_mode == "Colar jogos":
+        pasted = st.text_area("Cole um jogo por linha")
+        for game in split_game_lines(pasted, config, None):
+            games_meta.append((game, {"game_kind":"Avulso", "creation_mode":"Colado", "batch_label":""}))
+        st.caption(f"{len(games_meta)} linha(s) reconhecida(s) como apostas válidas.")
+    else:
+        image_file = st.file_uploader("Foto do volante/comprovante", type=["png","jpg","jpeg","webp"])
         if image_file is not None:
             if Image is not None:
-                img=Image.open(image_file)
-                st.image(img,caption="Imagem enviada",use_container_width=True)
+                img = Image.open(image_file)
+                st.image(img, caption="Imagem enviada", use_container_width=True)
                 if st.button("Executar OCR"):
                     if OCR_AVAILABLE:
                         try:
                             with st.spinner("Lendo a imagem..."):
-                                txt=pytesseract.image_to_string(img,lang="por",config="--psm 6")
-                            st.session_state.ocr_text=txt
+                                st.session_state.ocr_text = pytesseract.image_to_string(img, lang="por", config="--psm 6")
                         except Exception as exc:
                             st.error(f"OCR não disponível neste ambiente: {exc}")
                     else:
                         st.error("As dependências de OCR não estão disponíveis.")
             else:
                 st.error("Pillow não está disponível.")
-        ocr_text=st.text_area("Texto reconhecido/editável",value=st.session_state.get("ocr_text",""),height=180)
-        recognized=parse_numbers(ocr_text,config)
-        st.caption("O OCR serve como assistência e pode capturar números que não pertencem à aposta. Revise antes de usar.")
-        if recognized:
-            st.write("Números identificados:"," ".join(config.format_number(n) for n in recognized))
-        games_to_check=split_game_lines(ocr_text,config,None)
+        ocr_text = st.text_area("Texto reconhecido/editável", value=st.session_state.get("ocr_text", ""), height=180)
+        for game in split_game_lines(ocr_text, config, None):
+            games_meta.append((game, {"game_kind":"OCR", "creation_mode":"OCR", "batch_label":""}))
+        st.caption("O OCR é assistivo e pode capturar números que não pertencem à aposta. Revise antes de usar.")
 
-    if len(result_nums)==config.drawn_count and games_to_check:
-        result_set=set(result_nums)
-        rows=[]
-        for i,g in enumerate(games_to_check,1):
-            hits=sorted(set(g)&result_set)
-            rows.append({"Jogo":i,"Números":" - ".join(config.format_number(n) for n in g),"Acertos":len(hits),"Acertos encontrados":" - ".join(config.format_number(n) for n in hits)})
-        checked=pd.DataFrame(rows).sort_values("Acertos",ascending=False)
-        st.dataframe(checked,hide_index=True,use_container_width=True)
+    if len(result_nums) == config.drawn_count and games_meta:
+        result_set = set(result_nums)
+        rows = []
+        for i, (g, meta) in enumerate(games_meta, 1):
+            hits = sorted(set(g) & result_set)
+            misses = sorted(set(g) - result_set)
+            rows.append({
+                "Jogo": i,
+                "Tipo": str(meta.get("game_kind", "Jogo único") or "Jogo único"),
+                "Criação": str(meta.get("creation_mode", meta.get("source", "")) or ""),
+                "Bolão/Grupo": str(meta.get("batch_label", "") or ""),
+                "Números": " - ".join(config.format_number(n) for n in g),
+                "Acertos": len(hits),
+                "Erros": len(misses),
+                "Acertos encontrados": " - ".join(config.format_number(n) for n in hits) or "—",
+                "Números não acertados": " - ".join(config.format_number(n) for n in misses) or "—",
+            })
+        checked = pd.DataFrame(rows).sort_values(["Acertos", "Erros"], ascending=[False, True])
+        st.dataframe(checked, hide_index=True, use_container_width=True)
         st.bar_chart(checked["Acertos"].value_counts().sort_index())
-        prize=st.number_input("Prêmio recebido total (opcional)",min_value=0.0,value=0.0,step=1.0)
-        if prize>0 and st.button("Registrar prêmio no orçamento"):
-            REPO.add_budget(profile,"Prêmio",float(prize),lottery_name,"Prêmio informado no conferidor")
+        prize = st.number_input("Prêmio recebido total (opcional)", min_value=0.0, value=0.0, step=1.0)
+        if prize > 0 and st.button("Registrar prêmio no orçamento"):
+            REPO.add_budget(profile, "Prêmio", float(prize), lottery_name, f"Prêmio informado no conferidor · concurso {result_contest or ''}")
             st.success("Prêmio registrado.")
-    elif result_nums and len(result_nums)!=config.drawn_count:
+    elif result_nums and len(result_nums) != config.drawn_count:
         st.warning(f"O resultado precisa ter exatamente {config.drawn_count} dezenas válidas.")
+
 elif page == "💰 Orçamento":
     st.markdown("## Gestão de orçamento")
     st.write("Use esta área para acompanhar quanto foi registrado em apostas e quanto foi informado como prêmio. Defina um limite mensal para receber alertas de controle.")
@@ -2762,7 +3228,7 @@ elif page == "🗂️ Dados":
 
 elif page == "❓ FAQ":
     st.markdown("## FAQ — o que cada recurso faz")
-    st.info("Esta página resume os recursos da V3. O objetivo é analisar e organizar dados de loteria de forma transparente, sem afirmar que padrões passados preveem o próximo sorteio.")
+    st.info("Esta página resume os recursos da V3.4. O objetivo é analisar e organizar dados de loteria de forma transparente, sem afirmar que padrões passados preveem o próximo sorteio.")
 
     faq_sections = [
         ("📚 Fontes de dados", "Você pode usar resultados recentes consultados no Portal Loterias/CAIXA, carregar CSV/TXT/Excel ou criar uma simulação reproduzível por seed. Todo arquivo passa por validação de quantidade, duplicidade e faixa das dezenas."),
@@ -2770,9 +3236,11 @@ elif page == "❓ FAQ":
         ("🔥 Frequências e tendências", "Compara frequência histórica e recente, mostra desvio em relação ao valor esperado, intervalo médio, atraso atual, maior intervalo observado e uma classificação de frequência recente acima/próxima/abaixo do histórico."),
         ("🧩 Padrões", "Analisa paridade, repetição do concurso anterior, sequências consecutivas, faixas numéricas, distribuição da soma, pares e trios recorrentes e um índice de raridade histórica."),
         ("🕸️ Rede de coocorrência", "Cria um grafo em que dezenas são nós e conexões representam pares que apareceram juntos. Ele serve para explorar coocorrência histórica, não para inferir causalidade ou previsão."),
-        ("🎯 Gerador aleatório", "Gera jogos sem usar frequência histórica. Dentro do mesmo tamanho de aposta, combinações válidas têm a mesma probabilidade matemática de serem sorteadas."),
-        ("🎯 Gerador por perfil histórico", "Monta a quantidade definida de números dos grupos mais frequentes, neutros e menos frequentes. Os grupos são disjuntos para evitar a mesma dezena em duas categorias."),
-        ("🎛️ Gerador personalizado", "Permite obrigar ou excluir dezenas e aplicar filtros de pares, soma, consecutivos, repetição do último concurso, faixas ocupadas e diversidade entre os jogos."),
+        ("✍️ Jogos manuais e bolões", "Permite cadastrar um jogo único ou várias apostas agrupadas em um bolão, com concurso alvo, nome do grupo, quantidade de cotas e observações. Jogos manuais não dependem do modo cego porque o app não escolhe as dezenas por você."),
+        ("🔒 Modo cego", "Antes de qualquer geração automática, os resultados da aba Resultados CAIXA precisam ser zerados/ocultos. O app limpa snapshots oficiais da sessão, desabilita a sincronização CAIXA e cria um selo de auditoria. Consultar resultados ou conferir jogos bloqueia novamente a geração."),
+        ("🤖 Gerador automático sem histórico", "Os modos Aleatório puro, Equilíbrio teórico e Cobertura combinatória recebem apenas as regras matemáticas da modalidade, restrições digitadas pelo usuário e uma fonte aleatória. Eles não recebem frequência histórica, último concurso ou dezenas oficiais."),
+        ("📐 Probabilidade sem histórico", "Calcula combinações possíveis, probabilidade exata do prêmio máximo, paridade esperada e soma esperada diretamente pela combinatória. O equilíbrio teórico descreve estrutura; não torna um jogo mais provável que outro do mesmo tamanho."),
+        ("🎟️ Bolão automático", "Agrupa vários jogos gerados na mesma sessão cega, com nome e cotas opcionais. A diversidade controla a sobreposição e a cobertura combinatória busca espalhar pares de dezenas sem usar resultados reais."),
         ("🔀 Diversidade entre jogos", "Reduz a sobreposição entre jogos de uma mesma geração. O modo alto tenta repetir menos dezenas entre combinações, sem prometer maior chance de prêmio."),
         ("📐 Cobertura de pares e trios", "Mede quantos pares e trios diferentes aparecem no conjunto de jogos comparados ao universo formado pelas dezenas utilizadas. É uma métrica combinatória de diversidade."),
         ("🧮 Fechamentos/desdobramentos", "Parte de um conjunto-base maior e seleciona jogos buscando maximizar a cobertura de pares ou trios dentro de um limite de quantidade ou orçamento. Para bases enormes, o algoritmo trabalha com uma amostra de candidatos para manter o app responsivo."),
