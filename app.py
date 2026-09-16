@@ -1,23 +1,669 @@
 from __future__ import annotations
 
 import html
+import io
+import itertools
+import json
+import random
+import urllib.error
+import urllib.request
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
 import streamlit as st
 
-from loteria_app import (
-    LOTTERIES,
-    LotteryAnalytics,
-    fetch_recent_official_draws,
-    generate_profiled_bet,
-    load_tabular_bytes,
-    run_backtest,
-    simulate_draws,
-)
-from loteria_app.models import LoadReport
 
 
+# ===== config.py =====
+@dataclass(frozen=True, slots=True)
+class LotteryConfig:
+    name: str
+    slug: str
+    number_min: int
+    number_max: int
+    drawn_count: int
+    bet_min: int
+    bet_max: int
+    bet_default: int
+    display_width: int = 2
+
+    @property
+    def universe(self) -> tuple[int, ...]:
+        return tuple(range(self.number_min, self.number_max + 1))
+
+    @property
+    def universe_size(self) -> int:
+        return self.number_max - self.number_min + 1
+
+    def format_number(self, number: int) -> str:
+        return f"{number:0{self.display_width}d}"
+
+    def validate_bet_size(self, size: int) -> None:
+        if not self.bet_min <= size <= self.bet_max:
+            raise ValueError(
+                f"Aposta inválida para {self.name}: use de {self.bet_min} a {self.bet_max} números."
+            )
+
+
+LOTTERIES: dict[str, LotteryConfig] = {
+    "Mega-Sena": LotteryConfig(
+        name="Mega-Sena",
+        slug="megasena",
+        number_min=1,
+        number_max=60,
+        drawn_count=6,
+        bet_min=6,
+        bet_max=20,
+        bet_default=6,
+    ),
+    "Lotofácil": LotteryConfig(
+        name="Lotofácil",
+        slug="lotofacil",
+        number_min=1,
+        number_max=25,
+        drawn_count=15,
+        bet_min=15,
+        bet_max=20,
+        bet_default=15,
+    ),
+    "Quina": LotteryConfig(
+        name="Quina",
+        slug="quina",
+        number_min=1,
+        number_max=80,
+        drawn_count=5,
+        bet_min=5,
+        bet_max=15,
+        bet_default=5,
+    ),
+    "Lotomania": LotteryConfig(
+        name="Lotomania",
+        slug="lotomania",
+        number_min=0,
+        number_max=99,
+        drawn_count=20,
+        bet_min=50,
+        bet_max=50,
+        bet_default=50,
+    ),
+}
+
+
+# ===== models.py =====
+Draw = tuple[int, ...]
+
+
+@dataclass(slots=True)
+class LoadReport:
+    draws: list[Draw] = field(default_factory=list)
+    total_rows: int = 0
+    valid_rows: int = 0
+    rejected_rows: int = 0
+    rejected_wrong_count: int = 0
+    rejected_duplicates: int = 0
+    rejected_out_of_range: int = 0
+    source_name: str = ""
+    source_kind: str = "arquivo"
+    loaded_at: datetime = field(default_factory=datetime.now)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def success_rate(self) -> float:
+        if self.total_rows == 0:
+            return 0.0
+        return self.valid_rows / self.total_rows
+
+
+@dataclass(frozen=True, slots=True)
+class NumberGroups:
+    hot: tuple[int, ...]
+    neutral: tuple[int, ...]
+    cold: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedBet:
+    numbers: Draw
+    hot_count: int
+    neutral_count: int
+    cold_count: int
+    seed: int | None = None
+
+
+@dataclass(slots=True)
+class BacktestResult:
+    strategy_hits: list[int]
+    random_hits: list[int]
+    tested_draws: int
+    simulations_per_draw: int
+
+    @staticmethod
+    def average(values: Iterable[int]) -> float:
+        values = list(values)
+        return sum(values) / len(values) if values else 0.0
+
+    @property
+    def strategy_average(self) -> float:
+        return self.average(self.strategy_hits)
+
+    @property
+    def random_average(self) -> float:
+        return self.average(self.random_hits)
+
+    @property
+    def difference(self) -> float:
+        return self.strategy_average - self.random_average
+
+
+# ===== validators.py =====
+class DrawValidationError(ValueError):
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def validate_draw(numbers: list[int] | tuple[int, ...], config: LotteryConfig) -> Draw:
+    values = tuple(int(n) for n in numbers)
+
+    if len(values) != config.drawn_count:
+        raise DrawValidationError(
+            "wrong_count",
+            f"Esperados {config.drawn_count} números, recebidos {len(values)}.",
+        )
+
+    if len(set(values)) != len(values):
+        raise DrawValidationError("duplicates", "O sorteio contém números repetidos.")
+
+    if any(n < config.number_min or n > config.number_max for n in values):
+        raise DrawValidationError(
+            "out_of_range",
+            f"Há números fora do intervalo {config.number_min}–{config.number_max}.",
+        )
+
+    return tuple(sorted(values))
+
+
+# ===== analytics.py =====
+class LotteryAnalytics:
+    def __init__(self, draws: list[Draw], config: LotteryConfig):
+        self.draws = draws
+        self.config = config
+
+    def _counter(self, draws: list[Draw] | None = None) -> Counter[int]:
+        selected = self.draws if draws is None else draws
+        counter: Counter[int] = Counter(itertools.chain.from_iterable(selected))
+        for number in self.config.universe:
+            counter.setdefault(number, 0)
+        return counter
+
+    def frequency_table(self, last_n: int | None = None) -> pd.DataFrame:
+        selected = self.draws[-last_n:] if last_n else self.draws
+        count = self._counter(selected)
+        draw_count = len(selected)
+        expected = draw_count * self.config.drawn_count / self.config.universe_size if draw_count else 0.0
+        rows: list[dict] = []
+
+        for number in self.config.universe:
+            freq = count[number]
+            rows.append(
+                {
+                    "Número": number,
+                    "Frequência": freq,
+                    "Frequência %": (freq / draw_count * 100) if draw_count else 0.0,
+                    "Esperado": expected,
+                    "Desvio %": ((freq - expected) / expected * 100) if expected else 0.0,
+                    "Atraso": self.delay(number, selected),
+                    "Intervalo médio": self.average_interval(number, selected),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def delay(number: int, draws: list[Draw]) -> int:
+        for delay, draw in enumerate(reversed(draws)):
+            if number in draw:
+                return delay
+        return len(draws)
+
+    @staticmethod
+    def average_interval(number: int, draws: list[Draw]) -> float:
+        indices = [i for i, draw in enumerate(draws) if number in draw]
+        if len(indices) < 2:
+            return float("nan")
+        gaps = [b - a for a, b in zip(indices, indices[1:])]
+        return sum(gaps) / len(gaps)
+
+    def groups(
+        self,
+        last_n: int | None = None,
+        hot_fraction: float = 0.25,
+        cold_fraction: float = 0.25,
+    ) -> NumberGroups:
+        table = self.frequency_table(last_n)
+        hot_size = max(1, round(self.config.universe_size * hot_fraction))
+        cold_size = max(1, round(self.config.universe_size * cold_fraction))
+
+        if hot_size + cold_size >= self.config.universe_size:
+            cold_size = max(1, self.config.universe_size - hot_size - 1)
+
+        hot_df = table.sort_values(["Frequência", "Número"], ascending=[False, True]).head(hot_size)
+        hot = tuple(int(x) for x in hot_df["Número"].tolist())
+        hot_set = set(hot)
+
+        cold_candidates = table[~table["Número"].isin(hot_set)]
+        cold_df = cold_candidates.sort_values(["Frequência", "Número"], ascending=[True, True]).head(cold_size)
+        cold = tuple(int(x) for x in cold_df["Número"].tolist())
+        cold_set = set(cold)
+
+        neutral = tuple(n for n in self.config.universe if n not in hot_set and n not in cold_set)
+        return NumberGroups(hot=hot, neutral=neutral, cold=cold)
+
+    def recent_comparison(self, recent_n: int = 50) -> pd.DataFrame:
+        full = self.frequency_table().set_index("Número")
+        recent = self.frequency_table(min(recent_n, len(self.draws))).set_index("Número")
+        out = pd.DataFrame(index=full.index)
+        out["Histórico %"] = full["Frequência %"]
+        out[f"Últimos {min(recent_n, len(self.draws))} %"] = recent["Frequência %"]
+        out["Variação p.p."] = out.iloc[:, 1] - out.iloc[:, 0]
+        return out.reset_index()
+
+    def parity_distribution(self) -> pd.DataFrame:
+        counter: Counter[str] = Counter()
+        for draw in self.draws:
+            evens = sum(n % 2 == 0 for n in draw)
+            odds = len(draw) - evens
+            counter[f"{evens} pares / {odds} ímpares"] += 1
+        return pd.DataFrame(counter.most_common(), columns=["Composição", "Concursos"])
+
+    def sums(self) -> pd.Series:
+        return pd.Series([sum(draw) for draw in self.draws], name="Soma")
+
+    def consecutive_distribution(self) -> pd.DataFrame:
+        counter: Counter[int] = Counter()
+        for draw in self.draws:
+            ordered = sorted(draw)
+            count = sum(b == a + 1 for a, b in zip(ordered, ordered[1:]))
+            counter[count] += 1
+        return pd.DataFrame(sorted(counter.items()), columns=["Pares consecutivos", "Concursos"])
+
+    def repeats_from_previous(self) -> pd.DataFrame:
+        counter: Counter[int] = Counter()
+        for previous, current in zip(self.draws, self.draws[1:]):
+            counter[len(set(previous) & set(current))] += 1
+        return pd.DataFrame(sorted(counter.items()), columns=["Repetidos", "Ocorrências"])
+
+    def top_combinations(self, size: int = 2, limit: int = 20) -> pd.DataFrame:
+        if size not in (2, 3):
+            raise ValueError("Somente pares ou trios são suportados.")
+        counter: Counter[tuple[int, ...]] = Counter()
+        for draw in self.draws:
+            counter.update(itertools.combinations(sorted(draw), size))
+        rows = [(" - ".join(self.config.format_number(n) for n in combo), freq) for combo, freq in counter.most_common(limit)]
+        label = "Par" if size == 2 else "Trio"
+        return pd.DataFrame(rows, columns=[label, "Frequência"])
+
+    def summary(self) -> dict[str, float | int]:
+        if not self.draws:
+            return {"draws": 0, "average_sum": 0.0, "average_even": 0.0, "average_repeat": 0.0}
+        sums = [sum(draw) for draw in self.draws]
+        evens = [sum(n % 2 == 0 for n in draw) for draw in self.draws]
+        repeats = [len(set(a) & set(b)) for a, b in zip(self.draws, self.draws[1:])]
+        return {
+            "draws": len(self.draws),
+            "average_sum": sum(sums) / len(sums),
+            "average_even": sum(evens) / len(evens),
+            "average_repeat": sum(repeats) / len(repeats) if repeats else 0.0,
+        }
+
+
+# ===== generator.py =====
+def _sample_exact(rng: random.Random, pool: tuple[int, ...], count: int, label: str) -> list[int]:
+    if count < 0:
+        raise ValueError(f"Quantidade de números {label} não pode ser negativa.")
+    if count > len(pool):
+        raise ValueError(
+            f"Não há números {label} suficientes no grupo atual: solicitado {count}, disponível {len(pool)}."
+        )
+    return rng.sample(list(pool), count)
+
+
+def generate_profiled_bet(
+    config: LotteryConfig,
+    groups: NumberGroups,
+    bet_size: int,
+    hot_count: int,
+    cold_count: int,
+    seed: int | None = None,
+) -> GeneratedBet:
+    config.validate_bet_size(bet_size)
+    neutral_count = bet_size - hot_count - cold_count
+    if neutral_count < 0:
+        raise ValueError("Quentes + frios não pode ultrapassar o tamanho da aposta.")
+
+    rng = random.Random(seed)
+    selected: list[int] = []
+    selected.extend(_sample_exact(rng, groups.hot, hot_count, "quentes"))
+    selected.extend(_sample_exact(rng, groups.cold, cold_count, "frios"))
+    selected.extend(_sample_exact(rng, groups.neutral, neutral_count, "neutros"))
+
+    if len(selected) != len(set(selected)):
+        raise RuntimeError("Erro interno: grupos estatísticos deveriam ser disjuntos.")
+
+    return GeneratedBet(
+        numbers=tuple(sorted(selected)),
+        hot_count=hot_count,
+        neutral_count=neutral_count,
+        cold_count=cold_count,
+        seed=seed,
+    )
+
+
+def generate_random_bet(config: LotteryConfig, bet_size: int, seed: int | None = None) -> Draw:
+    config.validate_bet_size(bet_size)
+    rng = random.Random(seed)
+    return tuple(sorted(rng.sample(list(config.universe), bet_size)))
+
+
+def generate_from_history(
+    draws: list[Draw],
+    config: LotteryConfig,
+    bet_size: int,
+    hot_count: int,
+    cold_count: int,
+    seed: int | None = None,
+    last_n: int | None = None,
+) -> GeneratedBet:
+    if not draws:
+        raise ValueError("Carregue um histórico antes de gerar uma combinação.")
+    groups = LotteryAnalytics(draws, config).groups(last_n=last_n)
+    return generate_profiled_bet(config, groups, bet_size, hot_count, cold_count, seed)
+
+
+# ===== simulation.py =====
+def simulate_draws(config: LotteryConfig, quantity: int, seed: int | None = None) -> LoadReport:
+    rng = random.Random(seed)
+    quantity = max(1, int(quantity))
+    draws: list[Draw] = [
+        tuple(sorted(rng.sample(list(config.universe), config.drawn_count)))
+        for _ in range(quantity)
+    ]
+    return LoadReport(
+        draws=draws,
+        total_rows=quantity,
+        valid_rows=quantity,
+        source_name=f"Simulação (seed={seed})" if seed is not None else "Simulação aleatória",
+        source_kind="simulacao",
+    )
+
+
+# ===== backtest.py =====
+def run_backtest(
+    draws: list[Draw],
+    config: LotteryConfig,
+    bet_size: int,
+    hot_count: int,
+    cold_count: int,
+    training_window: int = 100,
+    simulations_per_draw: int = 10,
+    max_test_draws: int = 250,
+    seed: int = 42,
+) -> BacktestResult:
+    config.validate_bet_size(bet_size)
+    training_window = max(20, int(training_window))
+    simulations_per_draw = max(1, int(simulations_per_draw))
+
+    if len(draws) <= training_window:
+        raise ValueError(
+            f"Histórico insuficiente: são necessários mais de {training_window} concursos para o backtest."
+        )
+
+    rng = random.Random(seed)
+    start = max(training_window, len(draws) - max_test_draws)
+    strategy_hits: list[int] = []
+    random_hits: list[int] = []
+
+    for target_idx in range(start, len(draws)):
+        train = draws[max(0, target_idx - training_window) : target_idx]
+        target = set(draws[target_idx])
+        groups = LotteryAnalytics(train, config).groups()
+
+        for _ in range(simulations_per_draw):
+            s1 = rng.randrange(0, 2**31 - 1)
+            s2 = rng.randrange(0, 2**31 - 1)
+            profiled = generate_profiled_bet(
+                config,
+                groups,
+                bet_size,
+                hot_count,
+                cold_count,
+                seed=s1,
+            ).numbers
+            random_bet = generate_random_bet(config, bet_size, seed=s2)
+            strategy_hits.append(len(set(profiled) & target))
+            random_hits.append(len(set(random_bet) & target))
+
+    return BacktestResult(
+        strategy_hits=strategy_hits,
+        random_hits=random_hits,
+        tested_draws=len(draws) - start,
+        simulations_per_draw=simulations_per_draw,
+    )
+
+
+# ===== data_loader.py =====
+CAIXA_API_BASE = "https://servicebus2.caixa.gov.br/portaldeloterias/api"
+
+
+def _numeric_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    return df.apply(pd.to_numeric, errors="coerce")
+
+
+def _score_candidate_columns(df: pd.DataFrame, config: LotteryConfig) -> list[int]:
+    numeric = _numeric_matrix(df)
+    scores: list[tuple[float, int]] = []
+
+    for idx in range(numeric.shape[1]):
+        series = numeric.iloc[:, idx].dropna()
+        if series.empty:
+            continue
+
+        integer_like = series.map(lambda x: float(x).is_integer())
+        in_range = series.between(config.number_min, config.number_max)
+        valid_ratio = float((integer_like & in_range).mean())
+        coverage = min(1.0, len(series) / max(1, len(numeric)))
+        score = valid_ratio * 0.85 + coverage * 0.15
+        if valid_ratio >= 0.80:
+            scores.append((score, idx))
+
+    scores.sort(key=lambda item: (-item[0], item[1]))
+    return [idx for _, idx in scores[: config.drawn_count]]
+
+
+def dataframe_to_report(
+    df: pd.DataFrame,
+    config: LotteryConfig,
+    source_name: str,
+    source_kind: str = "arquivo",
+) -> LoadReport:
+    report = LoadReport(
+        total_rows=len(df),
+        source_name=source_name,
+        source_kind=source_kind,
+    )
+    if df.empty:
+        report.warnings.append("O arquivo não contém linhas de dados.")
+        return report
+
+    numeric = _numeric_matrix(df)
+    candidate_cols = _score_candidate_columns(df, config)
+    use_candidates = len(candidate_cols) == config.drawn_count
+
+    if use_candidates:
+        report.warnings.append(
+            f"Foram identificadas automaticamente {config.drawn_count} colunas de dezenas."
+        )
+
+    for _, row in numeric.iterrows():
+        if use_candidates:
+            raw_values = [row.iloc[i] for i in candidate_cols]
+        else:
+            raw_values = list(row.values)
+
+        values: list[int] = []
+        had_out_of_range = False
+        for value in raw_values:
+            if pd.isna(value):
+                continue
+            try:
+                as_float = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not as_float.is_integer():
+                continue
+            as_int = int(as_float)
+            if config.number_min <= as_int <= config.number_max:
+                values.append(as_int)
+            else:
+                had_out_of_range = True
+
+        if not use_candidates and len(values) > config.drawn_count:
+            # Em layout desconhecido, não truncamos silenciosamente: a linha é rejeitada.
+            report.rejected_rows += 1
+            report.rejected_wrong_count += 1
+            continue
+
+        try:
+            draw = validate_draw(values, config)
+        except DrawValidationError as exc:
+            report.rejected_rows += 1
+            if had_out_of_range or exc.reason == "out_of_range":
+                report.rejected_out_of_range += 1
+            elif exc.reason == "duplicates":
+                report.rejected_duplicates += 1
+            elif exc.reason == "wrong_count":
+                report.rejected_wrong_count += 1
+            continue
+
+        report.draws.append(draw)
+        report.valid_rows += 1
+
+    if report.rejected_rows:
+        report.warnings.append(
+            f"{report.rejected_rows} linha(s) foram ignoradas por não passarem pela validação."
+        )
+    return report
+
+
+def load_tabular_bytes(
+    data: bytes,
+    filename: str,
+    config: LotteryConfig,
+) -> LoadReport:
+    suffix = Path(filename).suffix.lower()
+
+    if suffix in {".xlsx", ".xls"}:
+        df = pd.read_excel(io.BytesIO(data), header=None)
+        return dataframe_to_report(df, config, filename)
+
+    if suffix not in {".csv", ".txt"}:
+        raise ValueError("Formato não suportado. Use CSV, TXT, XLSX ou XLS.")
+
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = data.decode(encoding)
+            df = pd.read_csv(
+                io.StringIO(text),
+                sep=None,
+                engine="python",
+                header=None,
+                dtype=str,
+            )
+            return dataframe_to_report(df, config, filename)
+        except Exception as exc:  # tentativa de fallback de encoding/separador
+            last_error = exc
+
+    raise ValueError(f"Não foi possível interpretar o arquivo: {last_error}")
+
+
+def _fetch_json(url: str, timeout: int = 12) -> dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 LotteryStatisticsDashboard/2.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise ConnectionError(f"Falha ao consultar a CAIXA: {exc}") from exc
+
+
+def fetch_latest_contest_number(config: LotteryConfig) -> int:
+    payload = _fetch_json(f"{CAIXA_API_BASE}/{config.slug}")
+    number = payload.get("numero")
+    if number is None:
+        raise ValueError("A resposta da CAIXA não informou o número do concurso.")
+    return int(number)
+
+
+def _fetch_contest(config: LotteryConfig, contest: int) -> tuple[int, tuple[int, ...]]:
+    payload = _fetch_json(f"{CAIXA_API_BASE}/{config.slug}/{contest}")
+    raw = payload.get("listaDezenas") or payload.get("dezenasSorteadasOrdemSorteio")
+    if not raw:
+        raise ValueError(f"Concurso {contest} sem dezenas na resposta.")
+    numbers = [int(str(value)) for value in raw]
+    return contest, validate_draw(numbers, config)
+
+
+def fetch_recent_official_draws(
+    config: LotteryConfig,
+    quantity: int,
+    max_workers: int = 10,
+) -> LoadReport:
+    quantity = max(1, int(quantity))
+    latest = fetch_latest_contest_number(config)
+    start = max(1, latest - quantity + 1)
+    contests = list(range(start, latest + 1))
+    report = LoadReport(
+        total_rows=len(contests),
+        source_name="CAIXA — endpoint público do Portal Loterias",
+        source_kind="oficial",
+    )
+
+    found: dict[int, tuple[int, ...]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_contest, config, n): n for n in contests}
+        for future in as_completed(futures):
+            contest = futures[future]
+            try:
+                number, draw = future.result()
+            except Exception as exc:
+                report.rejected_rows += 1
+                report.warnings.append(f"Concurso {contest}: {exc}")
+                continue
+            found[number] = draw
+
+    for contest in contests:
+        if contest in found:
+            report.draws.append(found[contest])
+            report.valid_rows += 1
+
+    if report.rejected_rows:
+        report.warnings.append(
+            "Alguns concursos não puderam ser carregados. O endpoint do Portal Loterias pode oscilar ou mudar sem aviso."
+        )
+    return report
+
+
+# ===== Streamlit UI =====
 st.set_page_config(
     page_title="Loterias — Laboratório Estatístico",
     page_icon="🍀",
