@@ -131,6 +131,20 @@ LOTTERIES: dict[str, LotteryConfig] = {
 }
 
 
+# Modalidades exibidas no painel geral de resultados oficiais.
+OFFICIAL_RESULT_GAMES: dict[str, dict[str, str]] = {
+    "Mega-Sena": {"slug": "megasena", "accent": "#1f9d55"},
+    "Lotofácil": {"slug": "lotofacil", "accent": "#7b2cbf"},
+    "Quina": {"slug": "quina", "accent": "#2563eb"},
+    "Lotomania": {"slug": "lotomania", "accent": "#f59e0b"},
+    "Timemania": {"slug": "timemania", "accent": "#0f9f6e"},
+    "Dia de Sorte": {"slug": "diadesorte", "accent": "#c58b12"},
+    "Dupla Sena": {"slug": "duplasena", "accent": "#b91c1c"},
+    "Super Sete": {"slug": "supersete", "accent": "#d97706"},
+    "+Milionária": {"slug": "maismilionaria", "accent": "#0f766e"},
+}
+
+
 # ===== models.py =====
 Draw = tuple[int, ...]
 
@@ -704,6 +718,26 @@ def _fetch_json(url: str, timeout: int = 12, attempts: int = 3) -> dict:
             time.sleep(0.6 * (2 ** attempt))
 
     raise ConnectionError(f"Falha ao consultar a API da CAIXA em {url}: {last_error}") from last_error
+
+
+def fetch_generic_official_result(slug: str, timeout: int = 8, attempts: int = 2) -> dict:
+    """Busca o resultado mais recente de qualquer modalidade do painel geral."""
+    return _fetch_json(f"{CAIXA_API_BASE}/{slug}", timeout=timeout, attempts=attempts)
+
+
+def _safe_money(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _display_number(value: object, width: int = 2) -> str:
+    text = str(value).strip()
+    try:
+        return f"{int(text):0{width}d}"
+    except (TypeError, ValueError):
+        return text
 
 
 def parse_official_contest(payload: dict, config: LotteryConfig, source_url: str = "") -> OfficialContest:
@@ -1614,6 +1648,128 @@ def cached_latest_official(lottery_name: str) -> OfficialContest:
     return fetch_official_contest(LOTTERIES[lottery_name])
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_all_official_results() -> dict[str, dict]:
+    """Consulta todas as modalidades do painel em paralelo e guarda por 5 minutos."""
+    results: dict[str, dict] = {}
+
+    def worker(item: tuple[str, dict[str, str]]) -> tuple[str, dict]:
+        name, meta = item
+        return name, fetch_generic_official_result(meta["slug"], timeout=8, attempts=2)
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(worker, item): item[0] for item in OFFICIAL_RESULT_GAMES.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                result_name, payload = future.result()
+                results[result_name] = payload
+            except Exception as exc:
+                results[name] = {"_error": str(exc)}
+    return results
+
+
+def info_card_html(label: str, value: str, subtitle: str = "", icon: str = "", accent: str = "#2563eb") -> str:
+    return f'''<div class="info-card" style="--accent:{html.escape(accent)}">
+      <div class="info-card-top"><span class="info-card-icon">{html.escape(icon)}</span><span class="info-card-label">{html.escape(label)}</span></div>
+      <div class="info-card-value">{html.escape(value)}</div>
+      <div class="info-card-subtitle">{html.escape(subtitle) if subtitle else "&nbsp;"}</div>
+    </div>'''
+
+
+def result_balls_html(values: Iterable[object], accent: str, width: int = 2, compact: bool = False) -> str:
+    size_class = "result-ball compact" if compact else "result-ball"
+    balls = "".join(
+        f'<span class="{size_class}" style="--accent:{html.escape(accent)}">{html.escape(_display_number(v, width))}</span>'
+        for v in values
+    )
+    return f'<div class="result-balls">{balls}</div>'
+
+
+def official_result_card_html(name: str, payload: dict, accent: str) -> str:
+    if payload.get("_error"):
+        return f'''<div class="official-card unavailable" style="--accent:{html.escape(accent)}">
+        <div class="official-card-title">{html.escape(name)}</div>
+        <div class="official-card-error">Resultado temporariamente indisponível</div></div>'''
+
+    contest = payload.get("numero", "—")
+    draw_date = str(payload.get("dataApuracao") or "—")
+    next_date = str(payload.get("dataProximoConcurso") or "")
+    prize = _safe_money(payload.get("valorEstimadoProximoConcurso"))
+    accumulated = bool(payload.get("acumulado", False))
+    status = "ACUMULOU" if accumulated else "TEVE GANHADOR"
+    status_class = "accumulated" if accumulated else "winner"
+    numbers = payload.get("listaDezenas") or []
+    ball_width = 1 if name == "Super Sete" else 2
+
+    primary = result_balls_html(numbers, accent, ball_width, compact=len(numbers) > 15)
+    special = ""
+    second = payload.get("listaDezenasSegundoSorteio") or []
+    if second:
+        special += '<div class="result-special-label">2º sorteio</div>' + result_balls_html(second, accent, 2)
+    trevos = payload.get("trevosSorteados") or []
+    if trevos:
+        special += '<div class="result-special-label">Trevos</div>' + result_balls_html(trevos, "#d4a72c", 1)
+    extra = str(payload.get("nomeTimeCoracaoMesSorte") or "").strip()
+    if extra:
+        extra_label = "Mês da Sorte" if name == "Dia de Sorte" else "Time do Coração"
+        special += f'<div class="official-extra"><span>{html.escape(extra_label)}</span><strong>{html.escape(extra)}</strong></div>'
+
+    prize_text = currency_br(prize) if prize else "—"
+    next_line = f"Próximo sorteio: {html.escape(next_date)}" if next_date else ""
+    return f'''<div class="official-card" style="--accent:{html.escape(accent)}">
+      <div class="official-card-header">
+        <div><div class="official-card-title">{html.escape(name)}</div><div class="official-card-contest">Concurso {html.escape(str(contest))} · {html.escape(draw_date)}</div></div>
+        <span class="status-pill {status_class}">{status}</span>
+      </div>
+      <div class="result-special-label">Resultado</div>
+      {primary}
+      {special}
+      <div class="official-card-footer">
+        <div><span>Próximo prêmio estimado</span><strong>{html.escape(prize_text)}</strong></div>
+        <div class="next-draw">{next_line}</div>
+      </div>
+    </div>'''
+
+
+def render_all_official_results() -> None:
+    st.markdown("## 🎰 Resultados oficiais das Loterias CAIXA")
+    st.caption("Último concurso disponível de cada modalidade. Atualização automática com cache de 5 minutos.")
+    _, header_right = st.columns([5, 1])
+    with header_right:
+        if st.button("↻ Atualizar todos", use_container_width=True, key="refresh_all_caixa"):
+            cached_all_official_results.clear()
+            cached_latest_official.clear()
+            st.rerun()
+
+    with st.spinner("Consultando os resultados oficiais da CAIXA..."):
+        results = cached_all_official_results()
+
+    names = list(OFFICIAL_RESULT_GAMES)
+    for start in range(0, len(names), 3):
+        cols = st.columns(3)
+        for col, name in zip(cols, names[start:start+3]):
+            meta = OFFICIAL_RESULT_GAMES[name]
+            payload = results.get(name, {"_error": "sem resposta"})
+            with col:
+                st.markdown(official_result_card_html(name, payload, meta["accent"]), unsafe_allow_html=True)
+                if not payload.get("_error"):
+                    tiers = payload.get("listaRateioPremio") or []
+                    with st.expander("Premiação e detalhes"):
+                        if tiers:
+                            table = pd.DataFrame([{
+                                "Faixa": t.get("descricaoFaixa", ""),
+                                "Ganhadores": int(t.get("numeroDeGanhadores") or 0),
+                                "Prêmio": currency_br(_safe_money(t.get("valorPremio"))),
+                            } for t in tiers])
+                            st.dataframe(table, hide_index=True, use_container_width=True)
+                        revenue = _safe_money(payload.get("valorArrecadado"))
+                        if revenue:
+                            st.caption(f"Arrecadação: {currency_br(revenue)}")
+
+    st.caption("Fonte: Portal Loterias/CAIXA. Algumas modalidades possuem elementos próprios, como segundo sorteio, trevos, Mês da Sorte ou Time do Coração.")
+
+
 def render_latest_official_card(lottery_name: str, config: LotteryConfig) -> None:
     """Exibe automaticamente o resultado atual da CAIXA sem exigir histórico carregado."""
     st.markdown("### 🔴 Resultado oficial CAIXA — atualização automática")
@@ -1624,15 +1780,21 @@ def render_latest_official_card(lottery_name: str, config: LotteryConfig) -> Non
         logger.warning("Latest CAIXA result unavailable for %s: %s", lottery_name, exc)
         return
 
-    top_left, top_mid, top_right, refresh_col = st.columns([1.1, 1, 1.15, .7])
-    top_left.metric("Concurso", latest.contest)
-    top_mid.metric("Data", latest.draw_date or "—")
-    top_right.metric("Próximo prêmio estimado", currency_br(latest.estimated_next_prize) if latest.estimated_next_prize else "—")
+    accent = OFFICIAL_RESULT_GAMES.get(lottery_name, {}).get("accent", "#2563eb")
+    top_left, top_mid, top_right, refresh_col = st.columns([1.1, 1, 1.25, .7])
+    with top_left:
+        st.markdown(info_card_html("Concurso", str(latest.contest), "último resultado oficial", "🏆", accent), unsafe_allow_html=True)
+    with top_mid:
+        st.markdown(info_card_html("Data", latest.draw_date or "—", "data da apuração", "📅", accent), unsafe_allow_html=True)
+    with top_right:
+        prize_text = currency_br(latest.estimated_next_prize) if latest.estimated_next_prize else "—"
+        st.markdown(info_card_html("Próximo prêmio", prize_text, latest.next_draw_date or "estimativa CAIXA", "💰", accent), unsafe_allow_html=True)
     if refresh_col.button("↻ Atualizar", key=f"refresh_caixa_{lottery_name}", use_container_width=True):
         cached_latest_official.clear()
+        cached_all_official_results.clear()
         st.rerun()
 
-    st.markdown(balls_html(latest.draw, config), unsafe_allow_html=True)
+    st.markdown(result_balls_html(latest.draw, accent, 2, compact=len(latest.draw) > 15), unsafe_allow_html=True)
     status = "ACUMULOU" if latest.accumulated else f"{latest.main_tier_winners} ganhador(es) na faixa principal"
     details = []
     if latest.next_draw_date:
@@ -1687,7 +1849,7 @@ def reset_lottery_state(lottery_name: str) -> None:
 
 # ===== Streamlit UI =====
 st.set_page_config(
-    page_title="Loterias Lab V3",
+    page_title="Loterias Lab V3.2",
     page_icon="🍀",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1713,6 +1875,18 @@ CUSTOM_CSS = """
   .number-grid {grid-template-columns:repeat(5,1fr);}
   [data-testid="stMetric"] {padding:10px;}
 }
+
+/* V3.2 - cards mais ricos */
+[data-testid="stMetric"] {position:relative;overflow:hidden;box-shadow:0 8px 24px rgba(15,23,42,.045);transition:transform .18s ease, box-shadow .18s ease;}
+[data-testid="stMetric"]:hover {transform:translateY(-2px);box-shadow:0 12px 30px rgba(15,23,42,.09);}
+.info-card {position:relative;min-height:132px;padding:17px 18px;border:1px solid rgba(128,128,128,.16);border-radius:20px;background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 9%, transparent),rgba(255,255,255,.02));box-shadow:0 9px 26px rgba(15,23,42,.055);overflow:hidden;}
+.info-card:before {content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent);}
+.info-card-top {display:flex;gap:8px;align-items:center;margin-bottom:12px}.info-card-icon{font-size:1.1rem}.info-card-label{font-size:.76rem;font-weight:750;letter-spacing:.055em;text-transform:uppercase;opacity:.65}.info-card-value{font-size:1.68rem;line-height:1.05;font-weight:850;letter-spacing:-.035em}.info-card-subtitle{font-size:.8rem;opacity:.62;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.official-card {position:relative;min-height:325px;padding:20px;border:1px solid rgba(128,128,128,.17);border-radius:24px;background:linear-gradient(155deg,color-mix(in srgb,var(--accent) 10%, transparent),rgba(255,255,255,.015) 55%);box-shadow:0 12px 30px rgba(15,23,42,.065);margin-bottom:14px;overflow:hidden;}
+.official-card:after{content:"";position:absolute;width:150px;height:150px;border-radius:50%;right:-65px;top:-65px;background:var(--accent);opacity:.08}.official-card.unavailable{min-height:150px;opacity:.72}.official-card-error{margin-top:18px;opacity:.65}.official-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;position:relative;z-index:1}.official-card-title{font-size:1.28rem;font-weight:850;letter-spacing:-.02em}.official-card-contest{font-size:.78rem;opacity:.62;margin-top:2px}.status-pill{font-size:.67rem;font-weight:850;padding:6px 9px;border-radius:999px;letter-spacing:.035em;white-space:nowrap}.status-pill.accumulated{background:rgba(239,68,68,.12);color:#dc2626;border:1px solid rgba(239,68,68,.22)}.status-pill.winner{background:rgba(16,185,129,.12);color:#059669;border:1px solid rgba(16,185,129,.22)}
+.result-special-label{font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:750;opacity:.56;margin:17px 0 7px}.result-balls{display:flex;flex-wrap:wrap;gap:7px;align-items:center}.result-ball{width:36px;height:36px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:.82rem;font-weight:850;background:var(--accent);color:white;box-shadow:0 5px 12px color-mix(in srgb,var(--accent) 25%, transparent);border:2px solid rgba(255,255,255,.35)}.result-ball.compact{width:31px;height:31px;font-size:.72rem}
+.official-extra{display:flex;justify-content:space-between;gap:12px;margin-top:12px;padding:10px 12px;border-radius:12px;background:rgba(128,128,128,.07);font-size:.8rem}.official-extra span{opacity:.62}.official-card-footer{border-top:1px solid rgba(128,128,128,.14);margin-top:17px;padding-top:13px}.official-card-footer>div:first-child{display:flex;justify-content:space-between;gap:10px;align-items:baseline}.official-card-footer span{font-size:.73rem;opacity:.62}.official-card-footer strong{font-size:1rem}.next-draw{font-size:.75rem;opacity:.58;margin-top:6px}
+@media(max-width:900px){.official-card{min-height:auto}.info-card{min-height:112px}.result-ball{width:34px;height:34px}.result-ball.compact{width:29px;height:29px}}
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -1752,7 +1926,7 @@ st.sidebar.divider()
 page = st.sidebar.radio(
     "Navegação",
     [
-        "🏠 Dashboard", "🔥 Frequências", "🧩 Padrões", "🕸️ Rede", "🎯 Gerador",
+        "🎰 Resultados CAIXA", "🏠 Dashboard", "🔥 Frequências", "🧩 Padrões", "🕸️ Rede", "🎯 Gerador",
         "🧮 Fechamentos", "🧪 Laboratório", "💼 Meus Jogos", "✅ Conferidor & OCR",
         "💰 Orçamento", "🗂️ Dados", "❓ FAQ",
     ],
@@ -1763,16 +1937,17 @@ st.sidebar.caption("Os recursos estatísticos descrevem padrões passados. Eles 
 
 st.markdown(
     f"""<div class="hero-card"><div class="kpi-label">{html.escape(lottery_name)}</div>
-    <h1 style="margin:.15rem 0 .2rem">Loterias Lab V3</h1>
+    <h1 style="margin:.15rem 0 .2rem">Loterias Lab V3.2</h1>
     <div style="opacity:.76">Análise histórica, geração por restrições, backtests, Monte Carlo, fechamentos, conferência e gestão de jogos.</div></div>""",
     unsafe_allow_html=True,
 )
 
-# Uma única chamada cacheada mantém o resultado mais recente visível mesmo sem histórico carregado.
-render_latest_official_card(lottery_name, config)
+# Resultado da modalidade selecionada continua disponível nas páginas analíticas.
+if page != "🎰 Resultados CAIXA":
+    render_latest_official_card(lottery_name, config)
 
-# FAQ can render without a loaded dataset.
-if page != "❓ FAQ" and (report is None or not report.draws):
+# Resultados gerais e FAQ funcionam mesmo sem histórico sincronizado.
+if page not in {"❓ FAQ", "🎰 Resultados CAIXA"} and (report is None or not report.draws):
     st.info("Carregue dados oficiais, um arquivo ou uma simulação na barra lateral para liberar as análises.")
     st.stop()
 
@@ -1787,18 +1962,26 @@ if report is not None and report.draws:
 else:
     active_draws = []
     analytics = AdvancedAnalytics([], config)
-if page == "🏠 Dashboard":
+if page == "🎰 Resultados CAIXA":
+    render_all_official_results()
+
+elif page == "🏠 Dashboard":
     summary = analytics.summary()
     freq = analytics.frequency_table()
     delay = analytics.delay_table()
     hot_number = int(freq.sort_values(["Frequência", "Número"], ascending=[False, True]).iloc[0]["Número"])
     delayed_number = int(delay.sort_values(["Atraso atual", "Número"], ascending=[False, True]).iloc[0]["Número"])
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Concursos", f"{len(active_draws):,}".replace(",", "."))
-    c2.metric("Mais frequente", config.format_number(hot_number))
-    c3.metric("Mais atrasado", config.format_number(delayed_number))
-    c4.metric("Soma média", f"{summary['average_sum']:.1f}")
-    c5.metric("Repetição média", f"{summary['average_repeat']:.2f}")
+    cards = [
+        (c1, "Concursos", f"{len(active_draws):,}".replace(",", "."), "na amostra ativa", "📚", "#2563eb"),
+        (c2, "Mais frequente", config.format_number(hot_number), "maior frequência observada", "🔥", "#ef4444"),
+        (c3, "Mais atrasado", config.format_number(delayed_number), "maior atraso atual", "⏳", "#f59e0b"),
+        (c4, "Soma média", f"{summary['average_sum']:.1f}", "soma média das dezenas", "∑", "#7c3aed"),
+        (c5, "Repetição média", f"{summary['average_repeat']:.2f}", "vs. concurso anterior", "↻", "#059669"),
+    ]
+    for col, label, value, subtitle, icon, accent in cards:
+        with col:
+            st.markdown(info_card_html(label, value, subtitle, icon, accent), unsafe_allow_html=True)
 
     st.markdown("### Mapa das dezenas")
     map_mode = st.segmented_control("Visualização", ["Frequência", "Atraso", "Desvio %"], default="Frequência")
