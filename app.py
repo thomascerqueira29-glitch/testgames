@@ -694,7 +694,7 @@ def _fetch_json(url: str, timeout: int = 12, attempts: int = 3) -> dict:
             url,
             headers={
                 "Accept": "application/json, text/plain, */*",
-                "User-Agent": "Mozilla/5.0 (compatible; LoteriasLab/3.1; +https://caixa.gov.br)",
+                "User-Agent": "Mozilla/5.0 (compatible; LoteriasLab/3.3; +https://caixa.gov.br)",
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
             },
@@ -863,7 +863,7 @@ def fetch_recent_official_draws(
 
 
 # ===== V3 advanced services =====
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.3.0"
 DB_PATH = Path(os.getenv("LOTTERY_LAB_DB", ".lottery_lab.db"))
 LOG_PATH = Path(os.getenv("LOTTERY_LAB_LOG", "lottery_lab.log"))
 
@@ -1649,6 +1649,36 @@ def cached_latest_official(lottery_name: str) -> OfficialContest:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def cached_recent_generic_results(slug: str, quantity: int) -> list[dict]:
+    """Busca os concursos mais recentes de uma modalidade do painel geral."""
+    quantity = max(1, min(int(quantity), 50))
+    latest = fetch_generic_official_result(slug, timeout=8, attempts=2)
+    latest_number = int(latest.get("numero") or 0)
+    if latest_number <= 0:
+        return []
+
+    contest_numbers = list(range(max(1, latest_number - quantity + 1), latest_number + 1))
+    results: dict[int, dict] = {latest_number: latest}
+
+    def worker(contest: int) -> tuple[int, dict]:
+        payload = _fetch_json(f"{CAIXA_API_BASE}/{slug}/{contest}", timeout=8, attempts=2)
+        return contest, payload
+
+    pending = [n for n in contest_numbers if n != latest_number]
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(worker, n): n for n in pending}
+        for future in as_completed(futures):
+            n = futures[future]
+            try:
+                contest, payload = future.result()
+                results[contest] = payload
+            except Exception as exc:
+                logger.warning("Falha ao buscar %s concurso %s: %s", slug, n, exc)
+
+    return [results[n] for n in sorted(results, reverse=True) if n in results]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def cached_all_official_results() -> dict[str, dict]:
     """Consulta todas as modalidades do painel em paralelo e guarda por 5 minutos."""
     results: dict[str, dict] = {}
@@ -1686,50 +1716,112 @@ def result_balls_html(values: Iterable[object], accent: str, width: int = 2, com
     return f'<div class="result-balls">{balls}</div>'
 
 
+def super_sete_result_html(values: Iterable[object], accent: str) -> str:
+    cells = []
+    for idx, value in enumerate(values, start=1):
+        cells.append(
+            '<div class="super-sete-cell">'
+            f'<span class="super-sete-col">C{idx}</span>'
+            f'<span class="super-sete-number" style="--accent:{html.escape(accent)}">{html.escape(_display_number(value, 1))}</span>'
+            '</div>'
+        )
+    return '<div class="super-sete-grid">' + ''.join(cells) + '</div>'
+
+
+def _meaningful_extra(value: object) -> str:
+    text = str(value or "").strip()
+    if not text or text in {"-", "--", "—", "N/A", "NA"}:
+        return ""
+    # Alguns retornos da CAIXA usam caracteres de substituição quando o campo não se aplica.
+    if text and all(ch in "�? \ufffd" for ch in text):
+        return ""
+    return text
+
+
 def official_result_card_html(name: str, payload: dict, accent: str) -> str:
     if payload.get("_error"):
-        return f'''<div class="official-card unavailable" style="--accent:{html.escape(accent)}">
-        <div class="official-card-title">{html.escape(name)}</div>
-        <div class="official-card-error">Resultado temporariamente indisponível</div></div>'''
+        return (
+            f'<div class="official-card unavailable" style="--accent:{html.escape(accent)}">'
+            f'<div class="official-card-topline"></div>'
+            f'<div class="official-card-title">{html.escape(name)}</div>'
+            '<div class="official-card-error">Resultado temporariamente indisponível</div>'
+            '</div>'
+        )
 
     contest = payload.get("numero", "—")
     draw_date = str(payload.get("dataApuracao") or "—")
     next_date = str(payload.get("dataProximoConcurso") or "")
+    next_contest = payload.get("numeroConcursoProximo")
     prize = _safe_money(payload.get("valorEstimadoProximoConcurso"))
     accumulated = bool(payload.get("acumulado", False))
     status = "ACUMULOU" if accumulated else "TEVE GANHADOR"
     status_class = "accumulated" if accumulated else "winner"
     numbers = payload.get("listaDezenas") or []
-    ball_width = 1 if name == "Super Sete" else 2
 
-    primary = result_balls_html(numbers, accent, ball_width, compact=len(numbers) > 15)
-    special = ""
+    if name == "Super Sete":
+        primary = super_sete_result_html(numbers, accent)
+    else:
+        primary = result_balls_html(numbers, accent, 2, compact=len(numbers) > 15)
+
+    special_parts: list[str] = []
     second = payload.get("listaDezenasSegundoSorteio") or []
-    if second:
-        special += '<div class="result-special-label">2º sorteio</div>' + result_balls_html(second, accent, 2)
-    trevos = payload.get("trevosSorteados") or []
-    if trevos:
-        special += '<div class="result-special-label">Trevos</div>' + result_balls_html(trevos, "#d4a72c", 1)
-    extra = str(payload.get("nomeTimeCoracaoMesSorte") or "").strip()
-    if extra:
-        extra_label = "Mês da Sorte" if name == "Dia de Sorte" else "Time do Coração"
-        special += f'<div class="official-extra"><span>{html.escape(extra_label)}</span><strong>{html.escape(extra)}</strong></div>'
+    if name == "Dupla Sena" and second:
+        special_parts.append('<div class="result-special-label">2º sorteio</div>')
+        special_parts.append(result_balls_html(second, accent, 2))
 
+    trevos = payload.get("trevosSorteados") or []
+    if name == "+Milionária" and trevos:
+        special_parts.append('<div class="result-special-label">Trevos</div>')
+        special_parts.append(result_balls_html(trevos, "#d4a72c", 1))
+
+    # Este campo só é relevante para estas duas modalidades. Em outras, a API
+    # pode retornar placeholders que não devem aparecer no card.
+    if name in {"Dia de Sorte", "Timemania"}:
+        extra = _meaningful_extra(payload.get("nomeTimeCoracaoMesSorte"))
+        if extra:
+            extra_label = "Mês da Sorte" if name == "Dia de Sorte" else "Time do Coração"
+            special_parts.append(
+                '<div class="official-extra">'
+                f'<span>{html.escape(extra_label)}</span>'
+                f'<strong>{html.escape(extra)}</strong>'
+                '</div>'
+            )
+
+    special = ''.join(special_parts)
     prize_text = currency_br(prize) if prize else "—"
-    next_line = f"Próximo sorteio: {html.escape(next_date)}" if next_date else ""
-    return f'''<div class="official-card" style="--accent:{html.escape(accent)}">
-      <div class="official-card-header">
-        <div><div class="official-card-title">{html.escape(name)}</div><div class="official-card-contest">Concurso {html.escape(str(contest))} · {html.escape(draw_date)}</div></div>
-        <span class="status-pill {status_class}">{status}</span>
-      </div>
-      <div class="result-special-label">Resultado</div>
-      {primary}
-      {special}
-      <div class="official-card-footer">
-        <div><span>Próximo prêmio estimado</span><strong>{html.escape(prize_text)}</strong></div>
-        <div class="next-draw">{next_line}</div>
-      </div>
-    </div>'''
+    next_bits = []
+    if next_contest:
+        next_bits.append(f"Concurso {html.escape(str(next_contest))}")
+    if next_date:
+        next_bits.append(html.escape(next_date))
+    next_text = " · ".join(next_bits) if next_bits else "Data ainda não informada"
+
+    # Mantido sem linhas HTML indentadas após conteúdo opcional: isso evita que
+    # o Markdown do Streamlit transforme trechos em bloco de código (bug visto
+    # no card do Super Sete quando 'special' estava vazio).
+    return (
+        f'<div class="official-card" style="--accent:{html.escape(accent)}">'
+        '<div class="official-card-topline"></div>'
+        '<div class="official-card-header">'
+        '<div class="official-heading">'
+        f'<div class="official-card-title">{html.escape(name)}</div>'
+        f'<div class="official-card-contest"><span>Concurso {html.escape(str(contest))}</span><span>{html.escape(draw_date)}</span></div>'
+        '</div>'
+        f'<span class="status-pill {status_class}">{status}</span>'
+        '</div>'
+        '<div class="result-special-label">Resultado oficial</div>'
+        f'{primary}'
+        f'{special}'
+        '<div class="official-card-spacer"></div>'
+        '<div class="official-card-footer">'
+        '<div class="prize-row">'
+        '<div class="prize-copy"><span>Próximo prêmio estimado</span>'
+        f'<strong>{html.escape(prize_text)}</strong></div>'
+        '</div>'
+        f'<div class="next-draw"><span class="next-draw-dot"></span><span>Próximo sorteio: {next_text}</span></div>'
+        '</div>'
+        '</div>'
+    )
 
 
 def render_all_official_results() -> None:
@@ -1768,6 +1860,42 @@ def render_all_official_results() -> None:
                             st.caption(f"Arrecadação: {currency_br(revenue)}")
 
     st.caption("Fonte: Portal Loterias/CAIXA. Algumas modalidades possuem elementos próprios, como segundo sorteio, trevos, Mês da Sorte ou Time do Coração.")
+
+    st.markdown("### 🗓️ Últimos concursos")
+    st.caption("Consulte resultados anteriores diretamente na CAIXA sem carregar toda a base analítica.")
+    h1, h2, h3 = st.columns([2.2, 1, 1.1])
+    history_name = h1.selectbox("Modalidade", names, key="official_history_game")
+    history_qty = h2.selectbox("Quantidade", [5, 10, 20, 30, 50], index=1, key="official_history_qty")
+    show_history = h3.checkbox("Mostrar histórico", value=False, key="official_history_show")
+
+    if show_history:
+        meta = OFFICIAL_RESULT_GAMES[history_name]
+        with st.spinner(f"Buscando os últimos {history_qty} concursos de {history_name}..."):
+            history = cached_recent_generic_results(meta["slug"], int(history_qty))
+        if not history:
+            st.warning("Não foi possível carregar o histórico dessa modalidade agora.")
+        else:
+            rows = []
+            for item in history:
+                nums = item.get("listaDezenas") or []
+                if history_name == "Super Sete":
+                    result_text = "  ".join(_display_number(v, 1) for v in nums)
+                else:
+                    result_text = "  ".join(_display_number(v, 2) for v in nums)
+                second = item.get("listaDezenasSegundoSorteio") or []
+                if second:
+                    result_text += "  |  2º: " + "  ".join(_display_number(v, 2) for v in second)
+                trevos = item.get("trevosSorteados") or []
+                if trevos:
+                    result_text += "  |  Trevos: " + "  ".join(_display_number(v, 1) for v in trevos)
+                rows.append({
+                    "Concurso": int(item.get("numero") or 0),
+                    "Data": str(item.get("dataApuracao") or ""),
+                    "Resultado": result_text,
+                    "Situação": "Acumulou" if bool(item.get("acumulado", False)) else "Teve ganhador",
+                })
+            history_df = pd.DataFrame(rows)
+            st.dataframe(history_df, hide_index=True, use_container_width=True, height=min(520, 38 * len(history_df) + 40))
 
 
 def render_latest_official_card(lottery_name: str, config: LotteryConfig) -> None:
@@ -1849,7 +1977,7 @@ def reset_lottery_state(lottery_name: str) -> None:
 
 # ===== Streamlit UI =====
 st.set_page_config(
-    page_title="Loterias Lab V3.2",
+    page_title="Loterias Lab V3.3",
     page_icon="🍀",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1876,17 +2004,17 @@ CUSTOM_CSS = """
   [data-testid="stMetric"] {padding:10px;}
 }
 
-/* V3.2 - cards mais ricos */
+/* V3.3 - cards corrigidos e historico oficial */
 [data-testid="stMetric"] {position:relative;overflow:hidden;box-shadow:0 8px 24px rgba(15,23,42,.045);transition:transform .18s ease, box-shadow .18s ease;}
 [data-testid="stMetric"]:hover {transform:translateY(-2px);box-shadow:0 12px 30px rgba(15,23,42,.09);}
 .info-card {position:relative;min-height:132px;padding:17px 18px;border:1px solid rgba(128,128,128,.16);border-radius:20px;background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 9%, transparent),rgba(255,255,255,.02));box-shadow:0 9px 26px rgba(15,23,42,.055);overflow:hidden;}
 .info-card:before {content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent);}
 .info-card-top {display:flex;gap:8px;align-items:center;margin-bottom:12px}.info-card-icon{font-size:1.1rem}.info-card-label{font-size:.76rem;font-weight:750;letter-spacing:.055em;text-transform:uppercase;opacity:.65}.info-card-value{font-size:1.68rem;line-height:1.05;font-weight:850;letter-spacing:-.035em}.info-card-subtitle{font-size:.8rem;opacity:.62;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.official-card {position:relative;min-height:325px;padding:20px;border:1px solid rgba(128,128,128,.17);border-radius:24px;background:linear-gradient(155deg,color-mix(in srgb,var(--accent) 10%, transparent),rgba(255,255,255,.015) 55%);box-shadow:0 12px 30px rgba(15,23,42,.065);margin-bottom:14px;overflow:hidden;}
-.official-card:after{content:"";position:absolute;width:150px;height:150px;border-radius:50%;right:-65px;top:-65px;background:var(--accent);opacity:.08}.official-card.unavailable{min-height:150px;opacity:.72}.official-card-error{margin-top:18px;opacity:.65}.official-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;position:relative;z-index:1}.official-card-title{font-size:1.28rem;font-weight:850;letter-spacing:-.02em}.official-card-contest{font-size:.78rem;opacity:.62;margin-top:2px}.status-pill{font-size:.67rem;font-weight:850;padding:6px 9px;border-radius:999px;letter-spacing:.035em;white-space:nowrap}.status-pill.accumulated{background:rgba(239,68,68,.12);color:#dc2626;border:1px solid rgba(239,68,68,.22)}.status-pill.winner{background:rgba(16,185,129,.12);color:#059669;border:1px solid rgba(16,185,129,.22)}
-.result-special-label{font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:750;opacity:.56;margin:17px 0 7px}.result-balls{display:flex;flex-wrap:wrap;gap:7px;align-items:center}.result-ball{width:36px;height:36px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:.82rem;font-weight:850;background:var(--accent);color:white;box-shadow:0 5px 12px color-mix(in srgb,var(--accent) 25%, transparent);border:2px solid rgba(255,255,255,.35)}.result-ball.compact{width:31px;height:31px;font-size:.72rem}
-.official-extra{display:flex;justify-content:space-between;gap:12px;margin-top:12px;padding:10px 12px;border-radius:12px;background:rgba(128,128,128,.07);font-size:.8rem}.official-extra span{opacity:.62}.official-card-footer{border-top:1px solid rgba(128,128,128,.14);margin-top:17px;padding-top:13px}.official-card-footer>div:first-child{display:flex;justify-content:space-between;gap:10px;align-items:baseline}.official-card-footer span{font-size:.73rem;opacity:.62}.official-card-footer strong{font-size:1rem}.next-draw{font-size:.75rem;opacity:.58;margin-top:6px}
-@media(max-width:900px){.official-card{min-height:auto}.info-card{min-height:112px}.result-ball{width:34px;height:34px}.result-ball.compact{width:29px;height:29px}}
+.official-card {position:relative;min-height:365px;padding:20px 20px 18px;border:1px solid rgba(128,128,128,.16);border-radius:22px;background:linear-gradient(160deg,color-mix(in srgb,var(--accent) 8%, transparent),rgba(255,255,255,.02) 48%,rgba(255,255,255,.01));box-shadow:0 10px 28px rgba(15,23,42,.07);margin-bottom:12px;overflow:hidden;display:flex;flex-direction:column;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease;}
+.official-card:hover{transform:translateY(-2px);box-shadow:0 16px 38px rgba(15,23,42,.10);border-color:color-mix(in srgb,var(--accent) 28%,rgba(128,128,128,.16))}.official-card-topline{position:absolute;left:0;right:0;top:0;height:4px;background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 38%,white));}.official-card:after{content:"";position:absolute;width:145px;height:145px;border-radius:50%;right:-70px;top:-75px;background:var(--accent);opacity:.07;pointer-events:none}.official-card.unavailable{min-height:180px;opacity:.72}.official-card-error{margin-top:18px;opacity:.65}.official-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;position:relative;z-index:1}.official-heading{min-width:0}.official-card-title{font-size:1.18rem;font-weight:850;letter-spacing:-.025em;line-height:1.12}.official-card-contest{display:flex;flex-wrap:wrap;gap:5px 9px;font-size:.72rem;opacity:.62;margin-top:6px}.official-card-contest span:first-child{font-weight:700}.status-pill{font-size:.62rem;font-weight:850;padding:6px 8px;border-radius:999px;letter-spacing:.04em;white-space:nowrap;box-shadow:inset 0 0 0 1px rgba(255,255,255,.18)}.status-pill.accumulated{background:rgba(239,68,68,.10);color:#dc2626;border:1px solid rgba(239,68,68,.20)}.status-pill.winner{background:rgba(16,185,129,.10);color:#059669;border:1px solid rgba(16,185,129,.20)}
+.result-special-label{font-size:.66rem;text-transform:uppercase;letter-spacing:.085em;font-weight:800;opacity:.52;margin:17px 0 8px}.result-balls{display:flex;flex-wrap:wrap;gap:7px;align-items:center}.result-ball{width:35px;height:35px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:.78rem;font-weight:850;background:var(--accent);color:white;box-shadow:0 5px 12px color-mix(in srgb,var(--accent) 24%,transparent);border:2px solid rgba(255,255,255,.42)}.result-ball.compact{width:30px;height:30px;font-size:.69rem}.official-card-spacer{flex:1;min-height:12px}
+.official-extra{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px;padding:10px 12px;border:1px solid rgba(128,128,128,.08);border-radius:12px;background:rgba(128,128,128,.055);font-size:.76rem}.official-extra span{opacity:.60}.official-extra strong{font-size:.78rem;text-align:right}.official-card-footer{border-top:1px solid rgba(128,128,128,.13);margin-top:14px;padding-top:13px}.prize-row{display:flex;justify-content:space-between;align-items:flex-end;gap:10px}.prize-copy{display:flex;width:100%;justify-content:space-between;align-items:baseline;gap:10px}.prize-copy span{font-size:.69rem;opacity:.58}.prize-copy strong{font-size:.98rem;letter-spacing:-.02em;color:var(--accent)}.next-draw{display:flex;align-items:center;gap:6px;font-size:.70rem;opacity:.60;margin-top:8px}.next-draw-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:0 0 auto}.super-sete-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}.super-sete-cell{display:flex;flex-direction:column;align-items:center;gap:4px}.super-sete-col{font-size:.55rem;opacity:.48;font-weight:800}.super-sete-number{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;background:var(--accent);color:#fff;font-size:.78rem;font-weight:900;box-shadow:0 5px 12px color-mix(in srgb,var(--accent) 22%,transparent)}
+@media(max-width:900px){.official-card{min-height:auto}.info-card{min-height:112px}.result-ball{width:34px;height:34px}.result-ball.compact{width:29px;height:29px}.super-sete-number{width:29px;height:29px}}
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -1937,7 +2065,7 @@ st.sidebar.caption("Os recursos estatísticos descrevem padrões passados. Eles 
 
 st.markdown(
     f"""<div class="hero-card"><div class="kpi-label">{html.escape(lottery_name)}</div>
-    <h1 style="margin:.15rem 0 .2rem">Loterias Lab V3.2</h1>
+    <h1 style="margin:.15rem 0 .2rem">Loterias Lab V3.3</h1>
     <div style="opacity:.76">Análise histórica, geração por restrições, backtests, Monte Carlo, fechamentos, conferência e gestão de jogos.</div></div>""",
     unsafe_allow_html=True,
 )
