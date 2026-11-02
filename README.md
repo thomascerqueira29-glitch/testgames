@@ -286,3 +286,44 @@ O equilíbrio teórico não é uma previsão de números vencedores. Jogos váli
 - A interface completa não foi validada em um navegador; testes de núcleo e persistência executados offline. API CAIXA e OCR dependem de serviços instalados/externos.
 
 Execute `python smoke_test.py`, `python tests/test_repository.py` e `streamlit run app.py`.
+
+
+## V4.1 — Layout aprimorado (02/11/2026)
+
+- Barra de marca em gradiente com identificação da versão.
+- Menu principal horizontal e subnavegação horizontal, com estado ativo destacado.
+- Título e descrição próprios para cada área; remoção do banner genérico repetitivo.
+- Painel de filtros lateral apenas para configuração, não para navegação.
+- Tabelas, cartões e abas com estilos consistentes; melhorias de largura em telas menores.
+- Sem mudanças na lógica estatística, nos conectores CAIXA ou no banco de dados.
+
+### Melhorias futuras que exigem infraestrutura adicional
+
+- Login individual real (OAuth/OIDC), com autorização por usuário.
+- Banco persistente hospedado, backup automático e políticas de retenção.
+- Teste visual de regressão em navegadores e dispositivos móveis.
+- Testes de integração com API oficial e OCR em ambiente provisionado.
+
+## Atualização V5.0 — confiabilidade e desempenho (sem redesenhar a interface)
+
+Esta versão preserva menus, CSS, páginas, geração de jogos e as rotinas anteriores.
+
+### Novidades implementadas
+- Cache SQLite para **concursos históricos** com validade de 24 horas, chave de integridade SHA-256 e nova validação matemática antes do uso. O concurso mais recente continua consultado na fonte.
+- Quando há histórico em cache, evita consultas HTTP repetidas dos mesmos concursos; metadados `historical_cache_hits` e `historical_api_requests` registram a economia de chamadas.
+- Confere se as dezenas ordenadas e a ordem do sorteio informadas pela API contêm exatamente os mesmos números. Rejeita inconsistência.
+- Limita respostas HTTP da API a 2 MB para impedir uso excessivo de memória por respostas inesperadas.
+- Melhora o SQLite com `busy_timeout`, `foreign_keys`, índices por perfil e verificação sob demanda (`LocalRepository.integrity_status()`). Mantém migração compatível com bancos antigos.
+- Inclui no backtest intervalo de confiança de 95% para a **diferença média por concurso**, usando como unidade de análise o concurso e não cada simulação, evitando subestimar a incerteza.
+- Testes offline adicionais em `tests/test_v5_reliability.py`.
+
+### Segurança e limites
+O cache local e o banco SQLite **não** substituem um banco persistente externo nem criam autenticação individual. Em Streamlit Cloud, configure `LOTTERY_LAB_DB` em armazenamento persistente ou exporte backups. Nenhuma análise histórica permite prever uma loteria justa com vantagem garantida. A API e os recursos OCR exigem teste de integração em ambiente conectado.
+
+### Verificação
+```
+python smoke_test.py
+python tests/test_repository.py
+python tests/test_v5_reliability.py
+streamlit run app.py
+```

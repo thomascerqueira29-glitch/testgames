@@ -56,3 +56,48 @@ div[role="radiogroup"]:has(input[aria-label="Área principal"]) {flex-wrap:wrap;
 @media(max-width:800px){.lotlab-topbar{padding:15px;flex-wrap:wrap;}.block-container{padding-left:.7rem;padding-right:.7rem;}}
 </style>
 """
+
+# V4.1: melhorias de hierarquia, contraste e densidade informacional.
+CUSTOM_CSS += """
+<style>
+:root {--ll-navy:#12344f;--ll-teal:#0a8394;--ll-border:#dce7ee;--ll-muted:#60778a;}
+.stApp {background:linear-gradient(180deg,#f2f6fa 0%,#f8fafc 42%,#f8fafc 100%);}
+[data-testid="stHeader"] {background:transparent;}
+.block-container {padding-top:.7rem;max-width:1530px;}
+.lotlab-topbar {position:relative;display:flex;justify-content:flex-start;align-items:center;gap:14px;border-radius:18px 18px 0 0;padding:20px 25px;background:linear-gradient(110deg,#102f49,#13445c 68%,#086f76);box-shadow:0 12px 30px rgba(11,43,65,.16);}
+.lotlab-brandmark {width:48px;height:48px;display:grid;place-items:center;border-radius:14px;font-size:25px;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.17);}
+.lotlab-brandtext {display:flex;flex-direction:column;gap:3px;}
+.lotlab-brandtext strong {font-size:1.32rem;line-height:1.15;font-weight:850;}
+.lotlab-brandtext small {color:#c4dce6;font-size:.8rem;}
+.lotlab-version {margin-left:auto;font-size:.76rem;border:1px solid rgba(255,255,255,.23);padding:8px 11px;border-radius:999px;color:#deedf2;white-space:nowrap;}
+.lotlab-status-dot {display:inline-block;width:7px;height:7px;border-radius:50%;background:#76e6aa;margin-right:4px;}
+.lotlab-version-divider {opacity:.5;padding:0 3px;}
+/* Top navigation is rendered using native Streamlit horizontal radio widgets. */
+[data-testid="stRadio"]:has([aria-label="Área principal"]) {background:#fff;padding:11px 12px 8px;border:1px solid var(--ll-border);border-top:0;border-radius:0 0 14px 14px;box-shadow:0 8px 16px rgba(15,50,77,.045);margin-bottom:10px;}
+[data-testid="stRadio"]:has([aria-label="Área principal"]) [role="radiogroup"] {gap:5px 8px;flex-wrap:wrap;}
+[data-testid="stRadio"]:has([aria-label="Área principal"]) label {padding:9px 14px!important;border-radius:10px!important;border:1px solid transparent!important;min-height:39px;transition:background .16s;}
+[data-testid="stRadio"]:has([aria-label="Área principal"]) label:has(input:checked) {background:#e7f5f6!important;border-color:#b7dce0!important;color:#006b7a!important;font-weight:750;}
+[data-testid="stRadio"]:has([aria-label="Seção"]) {background:rgba(232,241,246,.66);padding:8px 10px;border-radius:12px;margin-bottom:13px;}
+[data-testid="stRadio"]:has([aria-label="Seção"]) [role="radiogroup"] {gap:7px;flex-wrap:wrap;}
+[data-testid="stRadio"]:has([aria-label="Seção"]) label:has(input:checked) {background:#fff;border-radius:9px;box-shadow:0 2px 7px rgba(15,50,77,.10);font-weight:750;}
+.lotlab-page-heading {display:flex;justify-content:space-between;align-items:center;gap:14px;margin:17px 0 20px;padding:5px 2px;}
+.lotlab-page-heading h1 {font-size:clamp(1.45rem,2.4vw,2rem);margin:4px 0 5px;font-weight:850;color:#173650;letter-spacing:-.045em;}
+.lotlab-page-heading p {margin:0;color:#637d90;font-size:.88rem;}
+.lotlab-eyebrow {text-transform:uppercase;letter-spacing:.11em;font-size:.64rem;font-weight:800;color:#0b8392;}
+.lotlab-page-chip {font-size:.74rem;border:1px solid #d6e5e7;background:#eaf5f5;color:#326875;padding:8px 11px;border-radius:999px;white-space:nowrap;}
+[data-testid="stSidebar"] {background:#f0f5f9!important;border-right:1px solid #d6e2eb;}
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2 {color:#15394f;font-size:1.22rem;}
+[data-testid="stMetric"],.soft-card,.info-card,.official-card {background:#fff;border-color:#dfe9ef;box-shadow:0 5px 20px rgba(16,49,73,.045);}
+[data-testid="stMetric"] {border-left:3px solid #0b8b96;border-bottom:1px solid #dfe9ef;}
+[data-testid="stDataFrame"] {border:1px solid #dce7ee;border-radius:14px;overflow:hidden;background:#fff;}
+[data-testid="stExpander"] {border:1px solid #dce7ee;border-radius:12px;background:#fff;}
+.stButton button {border-radius:10px;min-height:37px;font-weight:650;}
+.stTabs [data-baseweb="tab-list"] {gap:7px;flex-wrap:wrap;border-bottom:1px solid #d6e3ea;}
+.stTabs [data-baseweb="tab"] {border-radius:9px 9px 0 0;padding:9px 14px;}
+.stTabs [aria-selected="true"] {background:#eaf6f7;color:#087786;}
+/* Ensure contrast and consistent sizing on small screens. */
+@media(max-width:800px){.lotlab-topbar{padding:14px;gap:10px}.lotlab-brandmark{width:39px;height:39px}.lotlab-version{display:none}.lotlab-page-heading{align-items:flex-start;flex-direction:column}.lotlab-page-chip{white-space:normal}.lotlab-page-heading h1{font-size:1.45rem}}
+/* Dark theme override, intentionally follows explicit dark selection. */
+@media(prefers-color-scheme:dark){.lotlab-topbar{color:white}}
+</style>
+"""
