@@ -273,3 +273,16 @@ Garantia de isolamento do gerador automático
 O bloco de criação automática não chama fetch_official_contest, cached_latest_official, cached_all_official_results, analytics.groups() nem usa active_draws. Isso reduz o risco de vazamento de informação do resultado real para o processo de criação.
 
 O equilíbrio teórico não é uma previsão de números vencedores. Jogos válidos com o mesmo tamanho continuam com a mesma probabilidade matemática do prêmio máximo. A métrica serve apenas para descrever a estrutura da combinação sob um modelo uniforme.
+
+## Loterias Lab V4.0 — melhorias implementadas
+
+- Menu superior com seis áreas e subabas horizontais, preservando as 13 funções originais.
+- Tema visual atualizado (azul-petróleo, cards e tabelas) em `components/theme.py`.
+- Carteira com filtros por concurso e tipo de jogo.
+- Exclusão de jogos vinculada ao perfil atual; importação de backup com prévia, confirmação, transação e proteção contra duplicatas exatas.
+- Configuração de tema em `.streamlit/config.toml` e testes do banco em `tests/test_repository.py`.
+- Caminho do SQLite configurável pela variável de ambiente `LOTTERY_LAB_DB`. Para hospedagem efêmera, exportar backups regularmente ou usar volume persistente.
+- **Segurança:** perfil local não é login; senha global APP_PASSWORD também não é login individual. Para uso público, é necessário um provedor de identidade e isolamento de dados antes de compartilhar a carteira.
+- A interface completa não foi validada em um navegador; testes de núcleo e persistência executados offline. API CAIXA e OCR dependem de serviços instalados/externos.
+
+Execute `python smoke_test.py`, `python tests/test_repository.py` e `streamlit run app.py`.

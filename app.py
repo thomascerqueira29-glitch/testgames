@@ -864,7 +864,7 @@ def fetch_recent_official_draws(
 
 
 # ===== V3 advanced services =====
-APP_VERSION = "3.4.0"
+APP_VERSION = "4.0.0"
 DB_PATH = Path(os.getenv("LOTTERY_LAB_DB", ".lottery_lab.db"))
 LOG_PATH = Path(os.getenv("LOTTERY_LAB_LOG", "lottery_lab.log"))
 
@@ -1384,9 +1384,10 @@ class LocalRepository:
         query += " ORDER BY id DESC"
         return pd.read_sql_query(query, self.conn, params=params)
 
-    def delete_bet(self, bet_id: int) -> None:
+    def delete_bet(self, bet_id: int, profile: str) -> None:
+        """Never delete a bet belonging to a different local profile."""
         if self.enabled:
-            self.conn.execute("DELETE FROM bets WHERE id=?", (int(bet_id),))
+            self.conn.execute("DELETE FROM bets WHERE id=? AND profile=?", (int(bet_id), profile))
             self.conn.commit()
 
     def save_strategy(self, profile: str, lottery: str, name: str, payload: dict) -> None:
@@ -1442,31 +1443,77 @@ class LocalRepository:
         return row[0] if row else default
 
     def import_backup(self, profile: str, payload: dict) -> dict[str, int]:
+        """Validate and import a JSON snapshot, ignoring exact duplicate records.
+
+        Local profiles are labels, not authenticated accounts. No source profile is
+        trusted as an authorization claim. Malformed files fail before writes.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("O backup deve conter um objeto JSON.")
+        records = {key: payload.get(key, []) for key in ("bets", "strategies", "budget")}
+        for key, rows in records.items():
+            if not isinstance(rows, list) or len(rows) > 50000 or any(not isinstance(r, dict) for r in rows):
+                raise ValueError(f"Seção inválida ou muito grande no backup: {key}")
+        normalized = {"bets": [], "strategies": [], "budget": []}
+        for row in records["bets"]:
+            lottery = str(row.get("lottery", ""))
+            if lottery not in LOTTERIES:
+                raise ValueError(f"Modalidade desconhecida no backup: {lottery}")
+            nums = tuple(int(x) for x in str(row.get("numbers", "")).split(",") if str(x).strip())
+            if not nums:
+                continue
+            # Check the exact game against the declared lottery rules.
+            cfg = LOTTERIES[lottery]
+            if len(nums) < cfg.bet_min or len(nums) > cfg.bet_max or len(set(nums)) != len(nums) or any(n not in cfg.universe for n in nums):
+                raise ValueError("Jogo inválido no backup. Nenhum registro foi importado.")
+            amount = float(row.get("amount", 0) or 0)
+            if not math.isfinite(amount) or amount < 0:
+                raise ValueError("Valor de aposta inválido no backup.")
+            normalized["bets"].append((lottery, ",".join(map(str, nums)), str(row.get("contest", "") or ""), amount,
+                str(row.get("source", "backup") or "backup"), str(row.get("notes", "") or ""),
+                str(row.get("batch_id", "") or ""), str(row.get("batch_label", "") or ""),
+                str(row.get("game_kind", "Jogo único") or "Jogo único"), str(row.get("creation_mode", "Manual") or "Manual"),
+                str(row.get("blind_token", "") or ""), int(row.get("shares", 0) or 0)))
+        for row in records["strategies"]:
+            data = json.loads(row.get("payload", "{}")) if isinstance(row.get("payload"), str) else row.get("payload", {})
+            if not isinstance(data, dict):
+                raise ValueError("Estratégia inválida no backup.")
+            normalized["strategies"].append((str(row.get("lottery", "")), str(row.get("name", "Estratégia importada")),
+                json.dumps(data, ensure_ascii=False, sort_keys=True)))
+        for row in records["budget"]:
+            kind = str(row.get("kind", "Aposta"))
+            if kind not in ("Aposta", "Prêmio"):
+                raise ValueError("Tipo de movimentação inválido no backup.")
+            amount = float(row.get("amount", 0) or 0)
+            if not math.isfinite(amount) or amount < 0:
+                raise ValueError("Valor de movimentação inválido no backup.")
+            normalized["budget"].append((kind, amount, str(row.get("lottery", "") or ""), str(row.get("notes", "") or "")))
         counts = {"bets": 0, "strategies": 0, "budget": 0}
         if not self.enabled:
             return counts
-        for row in payload.get("bets", []):
-            nums = tuple(int(x) for x in str(row.get("numbers", "")).split(",") if str(x).strip())
-            if nums:
-                self.add_bet(
-                    profile, str(row.get("lottery", "")), nums, str(row.get("contest", "")),
-                    float(row.get("amount", 0) or 0), str(row.get("source", "backup")), str(row.get("notes", "")),
-                    batch_id=str(row.get("batch_id", "") or ""), batch_label=str(row.get("batch_label", "") or ""),
-                    game_kind=str(row.get("game_kind", "Jogo único") or "Jogo único"),
-                    creation_mode=str(row.get("creation_mode", "Manual") or "Manual"),
-                    blind_token=str(row.get("blind_token", "") or ""), shares=int(row.get("shares", 0) or 0),
-                )
-                counts["bets"] += 1
-        for row in payload.get("strategies", []):
-            try:
-                data = json.loads(row.get("payload", "{}")) if isinstance(row.get("payload"), str) else dict(row.get("payload", {}))
-            except Exception:
-                data = {}
-            self.save_strategy(profile, str(row.get("lottery", "")), str(row.get("name", "Estratégia importada")), data)
-            counts["strategies"] += 1
-        for row in payload.get("budget", []):
-            self.add_budget(profile, str(row.get("kind", "Aposta")), float(row.get("amount", 0) or 0), str(row.get("lottery", "")), str(row.get("notes", "")))
-            counts["budget"] += 1
+        # One transaction, including duplicate detection; repeat import is idempotent.
+        cur = self.conn.cursor()
+        try:
+            old_bets = set(cur.execute("SELECT lottery,numbers,contest,amount,source,notes,batch_id,batch_label,game_kind,creation_mode,blind_token,shares FROM bets WHERE profile=?", (profile,)).fetchall())
+            old_strategies = set(cur.execute("SELECT lottery,name,payload FROM strategies WHERE profile=?", (profile,)).fetchall())
+            old_budget = set(cur.execute("SELECT kind,amount,lottery,notes FROM budget_entries WHERE profile=?", (profile,)).fetchall())
+            now = datetime.now().isoformat(timespec="seconds")
+            for row in normalized["bets"]:
+                if row not in old_bets:
+                    cur.execute("INSERT INTO bets(profile,created_at,lottery,numbers,contest,amount,source,notes,batch_id,batch_label,game_kind,creation_mode,blind_token,shares) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (profile,now,*row))
+                    old_bets.add(row); counts["bets"] += 1
+            for row in normalized["strategies"]:
+                if row not in old_strategies:
+                    cur.execute("INSERT INTO strategies(profile,created_at,lottery,name,payload) VALUES(?,?,?,?,?)", (profile,now,*row))
+                    old_strategies.add(row); counts["strategies"] += 1
+            for row in normalized["budget"]:
+                if row not in old_budget:
+                    cur.execute("INSERT INTO budget_entries(profile,created_at,kind,amount,lottery,notes) VALUES(?,?,?,?,?,?)", (profile,now,*row))
+                    old_budget.add(row); counts["budget"] += 1
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
         return counts
 
     def export_backup(self, profile: str) -> bytes:
@@ -2331,45 +2378,16 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-CUSTOM_CSS = """
-<style>
-:root { --card-radius: 18px; }
-.block-container {padding-top: 1.25rem; padding-bottom: 4rem; max-width: 1500px;}
-[data-testid="stSidebar"] {border-right:1px solid rgba(128,128,128,.16);}
-[data-testid="stMetric"] {border:1px solid rgba(128,128,128,.18);border-radius:var(--card-radius);padding:14px 16px;background:rgba(128,128,128,.025);}
-.lottery-balls {display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin:8px 0 16px 0;}
-.lottery-ball {border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:800;border:2px solid rgba(41,121,255,.42);background:rgba(41,121,255,.10);}
-.number-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(55px,1fr));gap:7px;margin:10px 0 18px;}
-.number-cell {border-radius:12px;padding:9px 5px;text-align:center;border:1px solid rgba(128,128,128,.16);font-weight:750;}
-.hero-card {border:1px solid rgba(128,128,128,.18);border-radius:24px;padding:22px 24px;margin:10px 0 18px;background:linear-gradient(135deg,rgba(41,121,255,.08),rgba(0,200,160,.04));}
-.soft-card {border:1px solid rgba(128,128,128,.16);border-radius:16px;padding:14px 16px;margin-bottom:10px;}
-.small-note {opacity:.76;font-size:.88rem;}
-.kpi-label {font-size:.8rem;opacity:.65;text-transform:uppercase;letter-spacing:.04em;}
-@media (max-width: 700px) {
-  .block-container {padding-left:.75rem;padding-right:.75rem;}
-  .lottery-ball {width:38px!important;height:38px!important;font-size:.82rem;}
-  .number-grid {grid-template-columns:repeat(5,1fr);}
-  [data-testid="stMetric"] {padding:10px;}
-}
-
-/* V3.4 - cards, modo cego e criacao auditavel */
-[data-testid="stMetric"] {position:relative;overflow:hidden;box-shadow:0 8px 24px rgba(15,23,42,.045);transition:transform .18s ease, box-shadow .18s ease;}
-[data-testid="stMetric"]:hover {transform:translateY(-2px);box-shadow:0 12px 30px rgba(15,23,42,.09);}
-.info-card {position:relative;min-height:132px;padding:17px 18px;border:1px solid rgba(128,128,128,.16);border-radius:20px;background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 9%, transparent),rgba(255,255,255,.02));box-shadow:0 9px 26px rgba(15,23,42,.055);overflow:hidden;}
-.info-card:before {content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent);}
-.info-card-top {display:flex;gap:8px;align-items:center;margin-bottom:12px}.info-card-icon{font-size:1.1rem}.info-card-label{font-size:.76rem;font-weight:750;letter-spacing:.055em;text-transform:uppercase;opacity:.65}.info-card-value{font-size:1.68rem;line-height:1.05;font-weight:850;letter-spacing:-.035em}.info-card-subtitle{font-size:.8rem;opacity:.62;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.official-card {position:relative;min-height:365px;padding:20px 20px 18px;border:1px solid rgba(128,128,128,.16);border-radius:22px;background:linear-gradient(160deg,color-mix(in srgb,var(--accent) 8%, transparent),rgba(255,255,255,.02) 48%,rgba(255,255,255,.01));box-shadow:0 10px 28px rgba(15,23,42,.07);margin-bottom:12px;overflow:hidden;display:flex;flex-direction:column;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease;}
-.official-card:hover{transform:translateY(-2px);box-shadow:0 16px 38px rgba(15,23,42,.10);border-color:color-mix(in srgb,var(--accent) 28%,rgba(128,128,128,.16))}.official-card-topline{position:absolute;left:0;right:0;top:0;height:4px;background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 38%,white));}.official-card:after{content:"";position:absolute;width:145px;height:145px;border-radius:50%;right:-70px;top:-75px;background:var(--accent);opacity:.07;pointer-events:none}.official-card.unavailable{min-height:180px;opacity:.72}.official-card-error{margin-top:18px;opacity:.65}.official-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;position:relative;z-index:1}.official-heading{min-width:0}.official-card-title{font-size:1.18rem;font-weight:850;letter-spacing:-.025em;line-height:1.12}.official-card-contest{display:flex;flex-wrap:wrap;gap:5px 9px;font-size:.72rem;opacity:.62;margin-top:6px}.official-card-contest span:first-child{font-weight:700}.status-pill{font-size:.62rem;font-weight:850;padding:6px 8px;border-radius:999px;letter-spacing:.04em;white-space:nowrap;box-shadow:inset 0 0 0 1px rgba(255,255,255,.18)}.status-pill.accumulated{background:rgba(239,68,68,.10);color:#dc2626;border:1px solid rgba(239,68,68,.20)}.status-pill.winner{background:rgba(16,185,129,.10);color:#059669;border:1px solid rgba(16,185,129,.20)}
-.result-special-label{font-size:.66rem;text-transform:uppercase;letter-spacing:.085em;font-weight:800;opacity:.52;margin:17px 0 8px}.result-balls{display:flex;flex-wrap:wrap;gap:7px;align-items:center}.result-ball{width:35px;height:35px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:.78rem;font-weight:850;background:var(--accent);color:white;box-shadow:0 5px 12px color-mix(in srgb,var(--accent) 24%,transparent);border:2px solid rgba(255,255,255,.42)}.result-ball.compact{width:30px;height:30px;font-size:.69rem}.official-card-spacer{flex:1;min-height:12px}
-.official-extra{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px;padding:10px 12px;border:1px solid rgba(128,128,128,.08);border-radius:12px;background:rgba(128,128,128,.055);font-size:.76rem}.official-extra span{opacity:.60}.official-extra strong{font-size:.78rem;text-align:right}.official-card-footer{border-top:1px solid rgba(128,128,128,.13);margin-top:14px;padding-top:13px}.prize-row{display:flex;justify-content:space-between;align-items:flex-end;gap:10px}.prize-copy{display:flex;width:100%;justify-content:space-between;align-items:baseline;gap:10px}.prize-copy span{font-size:.69rem;opacity:.58}.prize-copy strong{font-size:.98rem;letter-spacing:-.02em;color:var(--accent)}.next-draw{display:flex;align-items:center;gap:6px;font-size:.70rem;opacity:.60;margin-top:8px}.next-draw-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:0 0 auto}.super-sete-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}.super-sete-cell{display:flex;flex-direction:column;align-items:center;gap:4px}.super-sete-col{font-size:.55rem;opacity:.48;font-weight:800}.super-sete-number{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;background:var(--accent);color:#fff;font-size:.78rem;font-weight:900;box-shadow:0 5px 12px color-mix(in srgb,var(--accent) 22%,transparent)}
-@media(max-width:900px){.official-card{min-height:auto}.info-card{min-height:112px}.result-ball{width:34px;height:34px}.result-ball.compact{width:29px;height:29px}.super-sete-number{width:29px;height:29px}}
-</style>
-"""
+from components.theme import CUSTOM_CSS
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 maybe_authenticate()
 
 st.sidebar.markdown("## 🍀 Loterias Lab")
 st.sidebar.caption(f"Versão {APP_VERSION} · estatística, simulação e gestão")
+if not os.getenv("LOTTERY_LAB_DB"):
+    st.sidebar.warning("Carteira local: configure LOTTERY_LAB_DB em um volume persistente ou exporte backups regularmente.")
+if not REPO.enabled:
+    st.sidebar.error("Armazenamento indisponível. Jogos não serão salvos nesta sessão.")
 profile = st.sidebar.text_input("Perfil local", value=st.session_state.get("profile", "Meu perfil"), help="Usado para separar jogos, estratégias e orçamento no armazenamento local.")
 st.session_state.profile = profile.strip() or "Meu perfil"
 profile = st.session_state.profile
@@ -2398,15 +2416,23 @@ st.sidebar.caption(
 )
 report = data_source_controls(lottery_name, config)
 
-st.sidebar.divider()
-page = st.sidebar.radio(
-    "Navegação",
-    [
-        "🎰 Resultados CAIXA", "🏠 Dashboard", "🔥 Frequências", "🧩 Padrões", "🕸️ Rede", "🎟️ Criar Jogos",
-        "🧮 Fechamentos", "🧪 Laboratório", "💼 Meus Jogos", "✅ Conferidor & OCR",
-        "💰 Orçamento", "🗂️ Dados", "❓ FAQ",
-    ],
-)
+st.markdown("""<div class="lotlab-topbar"><div><strong>🍀 Loterias Lab</strong><br><small>Resultados · estatística · jogos · carteira</small></div><small>Dashboard V4.0 · navegação superior</small></div>""", unsafe_allow_html=True)
+MAIN_NAV = {
+    "Visão geral": ["🏠 Dashboard"],
+    "Resultados": ["🎰 Resultados CAIXA", "✅ Conferidor & OCR"],
+    "Análises": ["🔥 Frequências", "🧩 Padrões", "🕸️ Rede", "🧪 Laboratório"],
+    "Criar jogos": ["🎟️ Criar Jogos", "🧮 Fechamentos"],
+    "Meus jogos": ["💼 Meus Jogos", "💰 Orçamento"],
+    "Ferramentas": ["🗂️ Dados", "❓ FAQ"],
+}
+DEFAULT_AREA = "Visão geral"
+area_nav = st.radio("Área principal", list(MAIN_NAV), horizontal=True, label_visibility="collapsed", key="main_nav_area")
+subpages = MAIN_NAV[area_nav]
+if len(subpages) > 1:
+    page = st.radio("Seção", subpages, horizontal=True, label_visibility="collapsed", key=f"subnav_{area_nav}")
+else:
+    page = subpages[0]
+st.markdown("<div class='lotlab-nav-description'>Escolha a modalidade e a fonte dos dados no painel de filtros à esquerda.</div>", unsafe_allow_html=True)
 
 st.sidebar.divider()
 st.sidebar.caption("Os recursos estatísticos descrevem padrões passados. Eles não transformam uma combinação em mais provável no próximo sorteio.")
@@ -2966,6 +2992,17 @@ elif page == "💼 Meus Jogos":
                 st.dataframe(checked_wallet, hide_index=True, use_container_width=True, height=min(620, 38 * len(checked_wallet) + 45))
 
         st.markdown("### Carteira cadastrada")
+        filter_a, filter_b = st.columns(2)
+        with filter_a:
+            contest_query = st.text_input("Filtrar por concurso", placeholder="Ex.: 2900", key="wallet_contest_filter")
+        with filter_b:
+            wallet_kind = st.selectbox("Tipo de jogo", ["Todos"] + sorted(bets["game_kind"].dropna().astype(str).unique().tolist()), key="wallet_kind_filter") if "game_kind" in bets else "Todos"
+        if contest_query:
+            bets = bets[bets["contest"].fillna("").astype(str).str.contains(re.escape(contest_query.strip()), case=False, regex=True)]
+        if wallet_kind != "Todos":
+            bets = bets[bets["game_kind"] == wallet_kind]
+        if bets.empty:
+            st.info("Nenhum jogo corresponde aos filtros selecionados.")
         view = bets.copy()
         def fmt_numbers(r):
             cfg = LOTTERIES.get(str(r["lottery"]))
@@ -2981,18 +3018,25 @@ elif page == "💼 Meus Jogos":
         ids = bets["id"].astype(int).tolist()
         delete_id = st.selectbox("Excluir jogo", ids, format_func=lambda x:f"ID {x}")
         if st.button("Excluir selecionado"):
-            REPO.delete_bet(delete_id)
+            REPO.delete_bet(delete_id, profile)
             st.success("Jogo excluído.")
             st.rerun()
 
     st.markdown("### Backup do perfil")
     st.download_button("Baixar backup JSON", REPO.export_backup(profile), f"backup_loterias_lab_{re.sub(r'[^a-zA-Z0-9_-]+','_',profile)}.json", "application/json", use_container_width=True)
     backup_file = st.file_uploader("Restaurar backup JSON", type=["json"], key="backup_restore")
-    if backup_file is not None and st.button("Importar backup", key="backup_import"):
+    if backup_file is not None:
         try:
+            if backup_file.size > 10 * 1024 * 1024:
+                raise ValueError("O arquivo excede o limite de 10 MB.")
             payload = json.loads(backup_file.getvalue().decode("utf-8"))
-            counts = REPO.import_backup(profile, payload)
-            st.success(f"Backup importado: {counts['bets']} jogo(s), {counts['strategies']} estratégia(s), {counts['budget']} movimentação(ões).")
+            if not isinstance(payload, dict):
+                raise ValueError("Formato JSON incompatível.")
+            st.caption(f"Prévia: {len(payload.get('bets', []))} jogos, {len(payload.get('strategies', []))} estratégias e {len(payload.get('budget', []))} movimentações. Importação ignora duplicatas exatas.")
+            confirm_import = st.checkbox("Confirmo a importação para o perfil local atual", key="confirm_backup_import")
+            if st.button("Importar backup", key="backup_import", disabled=not confirm_import):
+                counts = REPO.import_backup(profile, payload)
+                st.success(f"Novos registros: {counts['bets']} jogo(s), {counts['strategies']} estratégia(s), {counts['budget']} movimentação(ões).")
         except Exception as exc:
             st.error(f"Backup inválido: {exc}")
 
